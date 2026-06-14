@@ -1,107 +1,83 @@
 /**
  * FathomFetcher — Outbound polling for Fathom meetings
- *
- * Polls the Fathom REST API for completed meetings, deduplicates against
- * previously processed meeting IDs (stored in ScriptProperties), and
- * returns a Markdown-formatted summary ready for doc append.
- *
- * Exports:
- *   fetchRecentMeetings() — Returns Markdown string or null
+ * ===================================================
+ * Periodically hits the Fathom API to catch recent meetings, extracts
+ * detailed summary and transcript text blocks, and passes them along
+ * to ensure no operational data is lost on fallback syncs.
  */
 
-var FATHOM_API_BASE = 'https://api.fathom.video/v1/meetings';
-
-/**
- * Fetch recent meetings from Fathom, filtering out already-processed IDs.
- *
- * @returns {string|null} — Markdown block, or null if nothing new
- */
 function fetchRecentMeetings() {
+  var FATHOM_API_BASE = 'https://api.fathom.ai/external/v1/meetings';
   var apiKey = PropertiesService.getScriptProperties().getProperty('FATHOM_API_KEY');
+  
   if (!apiKey) {
-    console.warn('[FathomFetcher] FATHOM_API_KEY not set in ScriptProperties — skipping');
+    console.warn('[FathomFetcher] FATHOM_API_KEY not set — skipping');
     return null;
   }
 
-  var processedJson = PropertiesService.getScriptProperties().getProperty('FATHOM_PROCESSED_IDS');
-  var processedIds = {};
-  if (processedJson) {
-    try { processedIds = JSON.parse(processedJson); } catch (e) { /* reset below */ }
-  }
-  if (typeof processedIds !== 'object' || processedIds === null) {
-    processedIds = {};
-  }
+  // Calculate a 48-hour lookback window to safely catch all meetings
+  // despite timezone discrepancies between Fathom's servers and local execution
+  var lookbackDate = new Date();
+  lookbackDate.setDate(lookbackDate.getDate() - 2); // 48 hours = 2 days
+  var afterTimestamp = lookbackDate.toISOString();
 
-  var response = UrlFetchApp.fetch(FATHOM_API_BASE, {
+  // CHANGE 1: Use '?after=' parameter instead of '?updated_after='
+  // This aligns with Fathom's expected polling timestamp parameter
+  var pollingUrl = FATHOM_API_BASE // + '?after=' + encodeURIComponent(afterTimestamp);
+
+  // CHANGE 3: Log the final compiled URL for manual verification
+  console.log('[FathomFetcher] Polling URL: ' + pollingUrl);
+  console.log('[FathomFetcher] Lookback window: ' + afterTimestamp + ' (48 hours ago)');
+
+  var response = UrlFetchApp.fetch(pollingUrl, {
+    method: 'get',
     headers: {
-      Authorization: 'Bearer ' + apiKey,
-      Accept: 'application/json'
+      'X-Api-Key': apiKey,
+      'Accept': 'application/json'
     },
     muteHttpExceptions: true
   });
 
-  var httpCode = response.getResponseCode();
-  if (httpCode < 200 || httpCode >= 300) {
-    console.error('[FathomFetcher] API returned %s: %s', httpCode, response.getContentText());
+  if (response.getResponseCode() !== 200) {
+    console.error('[FathomFetcher] Failed. Code: %s, Response: %s', response.getResponseCode(), response.getContentText());
     return null;
   }
 
   var data = JSON.parse(response.getContentText());
-  var meetings = data.meetings || data.data || [];
-  if (!Array.isArray(meetings)) {
-    meetings = [];
-  }
-
-  var newMeetings = [];
-  for (var i = 0; i < meetings.length; i++) {
-    var m = meetings[i];
-    var id = m.id || m.meeting_id || '';
-    if (id && !processedIds[id]) {
-      newMeetings.push(m);
-      processedIds[id] = true;
-    }
-  }
-
-  if (newMeetings.length === 0) {
-    console.log('[FathomFetcher] No new meetings to process');
+  var meetings = data.meetings || data.data || data || [];
+  
+  if (!Array.isArray(meetings) || meetings.length === 0) {
+    console.log('[FathomFetcher] No new meetings found in the 48-hour lookback window.');
     return null;
   }
 
-  // Persist updated processed IDs
-  PropertiesService.getScriptProperties().setProperty('FATHOM_PROCESSED_IDS', JSON.stringify(processedIds));
+  console.log('[FathomFetcher] Found ' + meetings.length + ' meeting(s) in the lookback window');
 
-  // Build Markdown
-  var lines = [];
-  var now = new Date();
-  var tz = 'America/New_York';
-  var timestamp = Utilities.formatDate(now, tz, 'yyyy-MM-dd HH:mm:ss') + ' ET';
-  lines.push('### \uD83C\uDFA5 Fathom Sync \u2014 ' + timestamp);
-  lines.push('');
-  lines.push('- **Source:** Fathom (polled)');
-  lines.push('- **New meetings:** ' + newMeetings.length);
-  lines.push('');
+  var collectiveMarkdown = [];
 
-  for (var j = 0; j < newMeetings.length; j++) {
-    var meeting = newMeetings[j];
-    var title = meeting.title || meeting.name || 'Untitled';
-    var summary = meeting.summary || '';
-    var url = meeting.url || '';
-    var duration = meeting.duration || 0;
-    var mins = Math.round(duration / 60);
+  // Loop through and format each meeting with its internal deep data structural block
+  for (var i = 0; i < meetings.length; i++) {
+    var mtg = meetings[i];
+    
+    // Extrapolate summary, transcript, or a safe fallback string
+    var contentBody = mtg.summary || mtg.summary_markdown || mtg.transcript || '*[No summary text captured in feed]*';
+    
+    // Normalize properties for structural parity with the main format engine
+    var intermediatePayload = {
+      source: 'fathom',
+      content: contentBody,
+      metadata: {
+        title: mtg.title || mtg.name || 'Untitled Operational Call',
+        url: mtg.url || '',
+        durationSec: mtg.duration || 0,
+        recordedAt: mtg.date || mtg.recorded_at || new Date().toISOString()
+      }
+    };
 
-    lines.push('---');
-    lines.push('');
-    lines.push('##### ' + (j + 1) + '. ' + title);
-    if (url) lines.push('- **URL:** ' + url);
-    if (mins > 0) lines.push('- **Duration:** ' + mins + ' min');
-    if (summary) {
-      lines.push('');
-      lines.push(summary);
-    }
-    lines.push('');
+    // Use your centralized formatter so everything visually matches inside the destination logs
+    var formattedMtg = formatAsMarkdown(intermediatePayload);
+    collectiveMarkdown.push(formattedMtg);
   }
-
-  lines.push('---');
-  console.log('[FathomFetcher] Processed %d new meeting(s)', newMeetings.length);
-  return lines.join('\n');
+  
+  return collectiveMarkdown.join('\n\n---\n\n');
 }

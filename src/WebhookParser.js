@@ -1,9 +1,9 @@
 /**
  * WebhookParser — Payload router and content extractor
- *
- * Detects the webhook source (Slack, Fathom, Triple Whale, Sellerboard)
- * from the JSON shape, extracts the meaningful message content, and
- * discards system metadata noise.
+ * ============================================================
+ * Inspects incoming webhook objects from external operational tools,
+ * normalizes payload signatures, extracts the structural heart
+ * of the event for markdown translation, and strips residual noise.
  */
 
 /**
@@ -41,24 +41,48 @@ function parsePayload(data) {
 }
 
 /**
- * Parse a Slack Events API payload.
+ * Parse a Slack Events API payload with identity resolution.
  * @param {Object} data
  * @returns {{ source: string, content: string, metadata: Object }}
  */
 function parseSlackPayload(data) {
   var event = data.event || {};
   var text = event.text || '';
-  var user = event.user || 'unknown';
-  var channel = event.channel || 'unknown';
+  var rawUser = event.user || 'unknown';
+  var rawChannel = event.channel || 'unknown';
   var threadTs = event.thread_ts || event.ts || '';
   var channelType = event.channel_type || 'unknown';
+
+  // ────────────────────────────────────────────────────────────
+  // 👥 Static Workspace Resolution Maps
+  // ────────────────────────────────────────────────────────────
+  var USER_MAP = {
+    'USLACKBOT': 'Slackbot'
+    // Add your team's raw Slack user IDs and real names here:
+    // 'U01234567': 'Marco (PM)'
+  };
+
+  var CHANNEL_MAP = {
+    // Add your critical channel IDs and names here:
+    // 'C01234567': 'project-roadmap',
+    // 'C98765432': 'daily-standups'
+  };
+
+  // Resolve identities or fall back gracefully to the raw ID
+  var resolvedUser = USER_MAP[rawUser] || rawUser;
+  var resolvedChannel = CHANNEL_MAP[rawChannel] || rawChannel;
+
+  // If it's a subtype change/bot message with an updated attachment text
+  if (!text && event.attachments && event.attachments.length > 0) {
+    text = event.attachments[0].text || event.attachments[0].fallback || '';
+  }
 
   return {
     source: 'slack',
     content: cleanText(text),
     metadata: {
-      user: user,
-      channel: channel,
+      user: resolvedUser,
+      channel: resolvedChannel,
       channelType: channelType,
       threadTimestamp: threadTs,
       teamId: data.team_id || '',

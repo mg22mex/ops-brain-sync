@@ -1,13 +1,13 @@
 /**
  * SellerboardFetcher — Daily CSV data fetcher for Sellerboard
- *
+ * ============================================================
  * Fetches a CSV file from a configurable daily link (typically a pre-signed
  * S3 URL or similar), parses the tabular data, extracts the latest row
  * (yesterday's finalized numbers), and returns a Markdown-formatted
  * summary table.
  *
  * Exports:
- *   fetchSellerboardDaily() — Returns Markdown string or null
+ * fetchSellerboardDaily() — Returns Markdown string or null
  */
 
 /**
@@ -38,8 +38,8 @@ function fetchSellerboardDaily() {
     return null;
   }
 
-  // Split into rows
-  var rows = csvText.split('\n');
+  // ✅ Fix: Split using regex to catch both \n and Windows \r\n variations smoothly
+  var rows = csvText.split(/\r?\n/);
   if (rows.length < 2) {
     console.warn('[SellerboardFetcher] CSV has no data rows (only %d lines)', rows.length);
     return null;
@@ -73,7 +73,7 @@ function fetchSellerboardDaily() {
   var timestamp = Utilities.formatDate(now, tz, 'yyyy-MM-dd HH:mm:ss') + ' ET';
 
   var lines = [];
-  lines.push('### \ud83d\udcc8 Sellerboard Sync \u2014 ' + timestamp);
+  lines.push('### 📈 Sellerboard Sync — ' + timestamp);
   lines.push('');
   lines.push('- **Source:** Sellerboard (polled CSV)');
   lines.push('- **Columns:** ' + headers.length);
@@ -84,6 +84,11 @@ function fetchSellerboardDaily() {
   for (var j = 0; j < headers.length && j < latestRow.length; j++) {
     var metricName = headers[j].trim();
     var metricValue = latestRow[j].trim();
+    
+    // Escape any internal pipe symbols to preserve structural layout of the markdown table
+    metricName = metricName.replace(/\|/g, '\\|');
+    metricValue = metricValue.replace(/\|/g, '\\|');
+    
     lines.push('| ' + metricName + ' | ' + metricValue + ' |');
   }
 
@@ -94,7 +99,7 @@ function fetchSellerboardDaily() {
 }
 
 /**
- * Simple CSV line parser — handles quoted fields.
+ * Simple CSV line parser — handles quoted fields and cleans string wrappers.
  * @param {string} line
  * @returns {string[]}
  */
@@ -108,12 +113,25 @@ function parseCSVLine_(line) {
     if (ch === '"') {
       inQuotes = !inQuotes;
     } else if (ch === ',' && !inQuotes) {
-      result.push(current);
+      result.push(cleanCSVField_(current));
       current = '';
     } else {
       current += ch;
     }
   }
-  result.push(current);
+  result.push(cleanCSVField_(current));
   return result;
+}
+
+/**
+ * Helper to strip outer quotes and residual carriage returns from a field value
+ * @private
+ */
+function cleanCSVField_(field) {
+  var clean = field.trim();
+  // Strip bounding quotes if present
+  if (clean.charAt(0) === '"' && clean.charAt(clean.length - 1) === '"') {
+    clean = clean.substring(1, clean.length - 1).trim();
+  }
+  return clean;
 }

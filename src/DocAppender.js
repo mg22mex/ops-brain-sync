@@ -1,9 +1,9 @@
 /**
- * DocAppender — Google Document append operations
+ * DocAppender — Google Document & File append operations
  *
  * Opens a target Google Doc by ID and appends pre-formatted Markdown text
- * to the end of its body.  Provides a thin wrapper around
- * DocumentApp.Body operations with clean error boundaries.
+ * to the end of its body. Also manages isolated daily Markdown files 
+ * inside the NotebookLM source folder for high-volume chat streams.
  */
 
 /**
@@ -24,7 +24,7 @@ function appendToDoc(docId, markdown) {
   var doc = DocumentApp.openById(docId);
   var body = doc.getBody();
 
-  // Insert a blank separator line before the new block
+  // Insert blank separator lines before the new block
   body.appendParagraph('');
   body.appendParagraph('');
 
@@ -41,7 +41,7 @@ function appendToDoc(docId, markdown) {
         [DocumentApp.Attribute.BOLD]: true
       });
     } else if (/^---$/.test(line)) {
-      // Horizontal rules — render as a thin heading for visual clarity
+      // Horizontal rules — render as a subtitle style for separation
       paragraph.setHeading(DocumentApp.ParagraphHeading.SUBTITLE);
     } else {
       paragraph.setHeading(DocumentApp.ParagraphHeading.NORMAL);
@@ -50,4 +50,45 @@ function appendToDoc(docId, markdown) {
 
   doc.saveAndClose();
   console.log('[DocAppender] Appended %d lines to doc %s', lines.length, docId);
+}
+
+/**
+ * Append a Slack message block to a single running daily log file
+ * inside the dedicated NotebookLM source folder.
+ *
+ * @param {string} folderId   — The NotebookLM source folder ID
+ * @param {string} markdown   — Pre-formatted Markdown message entry
+ */
+function appendSlackToDailyFile(folderId, markdown) {
+  if (!folderId || folderId.length === 0) {
+    throw new Error('appendSlackToDailyFile: folderId is empty');
+  }
+  if (!markdown || markdown.length === 0) return;
+
+  try {
+    var folder = DriveApp.getFolderById(folderId);
+    var dateString = Utilities.formatDate(new Date(), 'America/New_York', 'yyyy-MM-dd');
+    var fileName = 'Slack-Log-' + dateString + '.md';
+    
+    var file;
+    var files = folder.getFilesByName(fileName);
+    
+    if (files.hasNext()) {
+      // File exists for today, grab it
+      file = files.next();
+      var existingContent = file.getBlob().getDataAsString();
+      // Append the new message entry to the existing contents
+      var updatedContent = existingContent + '\n\n' + markdown;
+      file.setContent(updatedContent);
+    } else {
+      // Create a fresh file with a clean Markdown structure for NotebookLM
+      var initialContent = '# 💬 Slack Communication Transcript — ' + dateString + '\n\n' + markdown;
+      file = folder.createFile(fileName, initialContent, MimeType.PLAIN_TEXT);
+    }
+    
+    console.log('[DocAppender] Successfully pushed Slack message block to %s', fileName);
+  } catch (err) {
+    console.error('[DocAppender] Failed daily file snapshot append: %s', err.message);
+    throw err;
+  }
 }
