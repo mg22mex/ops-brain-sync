@@ -90,7 +90,7 @@ flowchart TD
         T2 --> T3{HTTP 200?}
         T3 -->|Yes| T4[Parse metrics JSON]
         T3 -->|No| T5[Log error, return null]
-        T4 --> T6[Format Markdown table<br/>Metric | Value]
+        T4 --> T6[Format Markdown table<br/>Metric / Value]
     end
 
     subgraph SB[Sellerboard Sync]
@@ -99,7 +99,7 @@ flowchart TD
         S3 -->|Yes| S4[Parse CSV headers + rows]
         S3 -->|No| S5[Log error, return null]
         S4 --> S6[Extract last non-empty row]
-        S6 --> S7[Format Markdown table<br/>Metric | Value]
+        S6 --> S7[Format Markdown table<br/>Metric / Value]
     end
 
     Fathom --> Append
