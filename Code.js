@@ -7,6 +7,10 @@ var DEFAULT_MASTER_SPREADSHEET_ID = '1d6ljzCm_JW6KT6yR0-GMii6cwZqcGG0UwZKZT9UNWC
 var DEFAULT_TARGET_DOC_ID = '10miHbalFoWzkwmGV9oHVU-CDWl8dXLZz4o2tby6lzcM';
 var DEFAULT_NOTEBOOK_SOURCE_FOLDER_ID = '1xyKFtE1a5kCAHve8bASGOcchAthPNLrB';
 
+// 3. Global Master Clock — set at runBackgroundSyncs() entry, consumed by all fetchers
+var SCRIPT_START_TIME = null; // Initialized in runBackgroundSyncs()
+var GLOBAL_MAX_EXECUTION_MS = 240000; // Strict 4-minute master cap
+
 // 2. Self-healing sanitization
 function sanitizeSpreadsheetId(id) {
   if (!id || typeof id !== 'string') return id;
@@ -114,18 +118,28 @@ function runBackgroundSyncs() {
   }
 
   console.log('[Background] ========== STARTING SYNC ==========');
-  
+
+  SCRIPT_START_TIME = new Date().getTime();
+  console.log('[Background] Global master clock set at %dms — ceiling is %dms', SCRIPT_START_TIME, GLOBAL_MAX_EXECUTION_MS);
+
   var masterSpreadsheetId = getValidSpreadsheetId();
   var targetDocId = PropertiesService.getScriptProperties().getProperty('TARGET_DOC_ID') || DEFAULT_TARGET_DOC_ID;
   var notebookFolderId = PropertiesService.getScriptProperties().getProperty('NOTEBOOK_SOURCE_FOLDER_ID') || DEFAULT_NOTEBOOK_SOURCE_FOLDER_ID;
 
   // Master Matrix Sync
-  try { 
-    processDriveMatrixSync(notebookFolderId, masterSpreadsheetId); 
-  } catch (err) { 
-    console.error('Drive Sync error: ' + err.message); 
+  try {
+    processDriveMatrixSync(notebookFolderId, masterSpreadsheetId);
+  } catch (err) {
+    console.error('Drive Sync error: ' + err.message);
   }
-  
+
+  // Global deadline check — skip remaining syncs if master clock is tapped out
+  if (new Date().getTime() - SCRIPT_START_TIME > GLOBAL_MAX_EXECUTION_MS) {
+    console.log('[Background] Global deadline reached after Drive Sync — skipping remaining syncs.');
+    executionLock.releaseLock();
+    return;
+  }
+
   // Fathom Polling Sync
   try {
     var fathomMarkdown = fetchRecentMeetings();
@@ -133,15 +147,29 @@ function runBackgroundSyncs() {
       var activeDocId = safeCheckAndRollover_(targetDocId);
       appendToDoc(activeDocId, fathomMarkdown);
     }
-  } catch (err) { 
-    console.error('Fathom Sync error: ' + err.message); 
+  } catch (err) {
+    console.error('Fathom Sync error: ' + err.message);
+  }
+
+  // Global deadline check
+  if (new Date().getTime() - SCRIPT_START_TIME > GLOBAL_MAX_EXECUTION_MS) {
+    console.log('[Background] Global deadline reached after Fathom Polling — skipping remaining syncs.');
+    executionLock.releaseLock();
+    return;
   }
 
   // Email Monitor For Fathom
   try {
     processFathomEmails();
-  } catch (err) { 
-    console.error('Fathom Email Monitor error: ' + err.message); 
+  } catch (err) {
+    console.error('Fathom Email Monitor error: ' + err.message);
+  }
+
+  // Global deadline check
+  if (new Date().getTime() - SCRIPT_START_TIME > GLOBAL_MAX_EXECUTION_MS) {
+    console.log('[Background] Global deadline reached after Fathom Emails — skipping remaining syncs.');
+    executionLock.releaseLock();
+    return;
   }
 
   // Triple Whale Sync
@@ -151,8 +179,15 @@ function runBackgroundSyncs() {
       var activeDocId = safeCheckAndRollover_(targetDocId);
       appendToDoc(activeDocId, twMarkdown);
     }
-  } catch (err) { 
-    console.error('TW Sync error: ' + err.message); 
+  } catch (err) {
+    console.error('TW Sync error: ' + err.message);
+  }
+
+  // Global deadline check
+  if (new Date().getTime() - SCRIPT_START_TIME > GLOBAL_MAX_EXECUTION_MS) {
+    console.log('[Background] Global deadline reached after Triple Whale — skipping remaining syncs.');
+    executionLock.releaseLock();
+    return;
   }
 
   // Sellerboard Sync
@@ -162,10 +197,17 @@ function runBackgroundSyncs() {
       var activeDocId = safeCheckAndRollover_(targetDocId);
       appendToDoc(activeDocId, sbMarkdown);
     }
-  } catch (err) { 
-    console.error('SB Sync error: ' + err.message); 
+  } catch (err) {
+    console.error('SB Sync error: ' + err.message);
   }
-  
+
+  // Global deadline check
+  if (new Date().getTime() - SCRIPT_START_TIME > GLOBAL_MAX_EXECUTION_MS) {
+    console.log('[Background] Global deadline reached after Sellerboard — skipping confirmation emails.');
+    executionLock.releaseLock();
+    return;
+  }
+
   // Operational Confirmations Email Sync
   try {
     processConfirmationEmails();
@@ -214,10 +256,16 @@ function processConfirmationEmails() {
 
   try {
     var searchQuery = 'subject:(confirmation OR order OR reference OR "nrf" OR "color reference")';
-    var threads = GmailApp.search(searchQuery, 0, 10); 
+    var threads = GmailApp.search(searchQuery, 0, 5);
     var targetDocId = PropertiesService.getScriptProperties().getProperty('TARGET_DOC_ID') || DEFAULT_TARGET_DOC_ID;
-    
+
     for (var i = 0; i < threads.length; i++) {
+      // Global master clock guard — exit before the 4-minute platform ceiling
+      if (new Date().getTime() - SCRIPT_START_TIME > GLOBAL_MAX_EXECUTION_MS) {
+        console.log('[ConfirmationEmails] Global deadline reached (%dms) — exiting early after %d thread(s).',
+          GLOBAL_MAX_EXECUTION_MS, i);
+        break;
+      }
       var messages = threads[i].getMessages();
       var msg = messages[messages.length - 1]; 
       
@@ -246,4 +294,20 @@ function processConfirmationEmails() {
 
 function jsonResponse(httpCode, body) {
   return ContentService.createTextOutput(JSON.stringify(body)).setMimeType(ContentService.MimeType.JSON);
+}
+
+function installBackgroundTrigger() {
+  // Clear any old instances to avoid duplicate stacking
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    ScriptApp.deleteTrigger(triggers[i]);
+  }
+  
+  // Create a clean, new hourly trigger
+  ScriptApp.newTrigger('runBackgroundSyncs')
+           .timeBased()
+           .everyHours(1)
+           .create();
+  
+  console.log("[Trigger] Successfully registered hourly time-driven execution hook.");
 }
