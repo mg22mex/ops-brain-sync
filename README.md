@@ -22,7 +22,7 @@ ops-brain-sync is a serverless Google Apps Script data integration engine that o
 | Constraint | Limit | Mitigation |
 |-----------|-------|------------|
 | Document word ceiling | ~380,000 (warning) / 500,000 (NotebookLM hard cap) | Automated monthly rollover via `safeCheckAndRollover_` |
-| Script execution timeout | 6 minutes (Apps Script hard limit) | Time-batched polling; each fetcher runs independently with individual try/catch |
+| Script execution timeout | 6 minutes (Apps Script hard limit) | Global master clock (`GLOBAL_MAX_EXECUTION_MS = 240000`) with 3-level enforcement: inter-fetcher barriers, per-iteration loop guards, and mid-message deadline check |
 | Webhook payload truncation | ~15,000 characters per append (document bloat guard) | `cleanText()` strips control characters, collapses excess whitespace |
 | Lock contention | 30,000 ms `LockService.waitLock` | Mutex on all write operations to prevent race conditions on concurrent triggers |
 
@@ -68,30 +68,67 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    Trigger[Time-Driven Trigger<br/>09:15 ET Daily] --> runBackgroundSyncs
+    Trigger[Time-Driven Trigger<br/>Hourly] --> runBackgroundSyncs
 
-    runBackgroundSyncs --> Lock{LockService<br/>waitLock 30s}
+    runBackgroundSyncs --> Lock{LockService<br/>waitLock 15s}
+    Lock -->|Acquired| SCRIPT_START_TIME[Set global master clock<br/>SCRIPT_START_TIME = now()]
+    Lock -->|Timeout| EXIT1[Exit — skip this cycle]
 
-    Lock -->|Acquired| Fathom
-    Lock -->|Acquired| TW[Triple Whale]
-    Lock -->|Acquired| SB[Sellerboard]
+    SCRIPT_START_TIME --> Drive
 
-    subgraph Fathom[Fathom Sync]
-        F1[fetchRecentMeetings] --> F2[GET api.fathom.video/v1/meetings]
-        F2 --> F3{HTTP 200?}
-        F3 -->|Yes| F4[Dedup via<br/>FATHOM_PROCESSED_IDS]
-        F3 -->|No| F5[Log error, return null]
-        F4 -->|New meetings found| F6[Format Markdown<br/>title, summary, duration]
-        F4 -->|None new| F7[Return null]
+    subgraph Drive[DriveFileFetcher]
+        D1[processDriveMatrixSync] --> D2[Open master spreadsheet]
+        D2 --> D3[Parse layers → Markdown]
+        D3 --> D4[Save snapshot to Drive folder]
+        D4 --> D5[Discover linked Drive files<br/>from cell URLs]
+        D5 --> D6[Per-link: open + extract + save]
     end
+
+    Drive --> DC1{Deadline check<br/>> 4 min?}
+    DC1 -->|Yes| DRIVE_EXIT[Skip remaining modules]
+    DC1 -->|No| FathomAPI
+
+    subgraph FathomAPI[Fathom API Poll]
+        FA1[fetchRecentMeetings] --> FA2[GET api.fathom.ai/v1/meetings<br/>48h lookback]
+        FA2 --> FA3{HTTP 200?}
+        FA3 -->|Yes| FA4[Format meeting summaries]
+        FA3 -->|No| FA5[Log error, return null]
+    end
+
+    FathomAPI --> DC2{Deadline check<br/>> 4 min?}
+    DC2 -->|Yes| FATHOM_EXIT[Skip remaining modules]
+    DC2 -->|No| FathomEmail
+
+    subgraph FathomEmail[Fathom Gmail Processing]
+        FE1[processFathomEmails] --> FE2[Search Gmail:<br/>subject:Recap for<br/>-label:Processed-Fathom]
+        FE2 --> FE3{Threads found?}
+        FE3 -->|Yes| FE4[Per-thread: get messages]
+        FE4 --> FE5{Per-message:<br/>deadline OK?}
+        FE5 -->|Yes| FE6[Format + appendToDoc]
+        FE6 --> FE7[Mid-message guard:<br/>deadline check<br/>before append]
+        FE7 -->|Deadline hit| FE8[Set innerLoopAborted<br/>break — skip label]
+        FE7 -->|OK| FE5
+        FE5 -->|No| FE9{Done all msgs?}
+        FE9 -->|Yes| FE10[Apply Processed-Fathom label]
+        FE9 -->|No| FE5
+        FE3 -->|No| FE11[Return null]
+    end
+
+    FathomEmail --> DC3{Deadline check<br/>> 4 min?}
+    DC3 -->|Yes| TW_EXIT[Skip remaining modules]
+    DC3 -->|No| TW
 
     subgraph TW[Triple Whale Sync]
         T1[fetchTripleWhalePerformance] --> T2[POST api.triplewhale.com/v2/...]
         T2 --> T3{HTTP 200?}
         T3 -->|Yes| T4[Parse metrics JSON]
         T3 -->|No| T5[Log error, return null]
-        T4 --> T6[Format Markdown table<br/>Metric / Value]
+        T4 --> T6[Format Markdown table]
     end
+
+    TW --> DC4{Deadline check<br/>> 4 min?}
+    DC4 -->|Yes| SB_EXIT[Skip remaining modules]
+    DC4 -->|No| SB
 
     subgraph SB[Sellerboard Sync]
         S1[fetchSellerboardDaily] --> S2[GET CSV from<br/>SELLERBOARD_DAILY_LINK]
@@ -99,12 +136,25 @@ flowchart TD
         S3 -->|Yes| S4[Parse CSV headers + rows]
         S3 -->|No| S5[Log error, return null]
         S4 --> S6[Extract last non-empty row]
-        S6 --> S7[Format Markdown table<br/>Metric / Value]
+        S6 --> S7[Format Markdown table]
     end
 
-    Fathom --> Append
-    TW --> Append
-    SB --> Append
+    SB --> DC5{Deadline check<br/>> 4 min?}
+    DC5 -->|Yes| CONFIRM_EXIT[Skip confirmation emails]
+    DC5 -->|No| Confirm
+
+    subgraph Confirm[Confirmation Emails]
+        C1[processConfirmationEmails] --> C2[Search Gmail:<br/>confirmation/order/reference]
+        C2 --> C3[Per-thread: format + append]
+        C3 --> C4[Retry on failure]
+    end
+
+    Confirm --> Append
+    DC1 -->|Yes| Append
+    DC2 -->|Yes| Append
+    DC3 -->|Yes| Append
+    DC4 -->|Yes| Append
+    DC5 -->|Yes| Append
 
     subgraph Append[Doc Append Pipeline]
         A1[Rollover check] --> A2{Word count<br/>>= 380K?}
@@ -113,10 +163,9 @@ flowchart TD
         A4 --> A5[Update TARGET_DOC_ID<br/>in ScriptProperties]
         A3 --> A6[appendToDoc]
         A5 --> A6
-        A6 --> A7[saveAndClose]
     end
 
-    Append --> Done[runBackgroundSyncs complete<br/>results: fathom/tw/sellerboard status]
+    Append --> Done[runBackgroundSyncs complete]
 ```
 
 ---
@@ -133,6 +182,7 @@ flowchart TD
 | **Fathom Fetcher** | `src/FathomFetcher.js` | Poller | `GET api.fathom.video/v1/meetings` with Bearer token. Dedup via `FATHOM_PROCESSED_IDS` property. Reports title, URL, duration, summary per meeting |
 | **Triple Whale Fetcher** | `src/TripleWhaleFetcher.js` | Poller | POST to Triple Whale summary endpoint with `x-api-key`. 7-day lookback. Renders metrics as a table |
 | **Sellerboard Fetcher** | `src/SellerboardFetcher.js` | Poller | Fetch CSV from pre-signed URL, parse with quoted-field support, extract latest row, render as key/value table |
+| **Drive File Fetcher** | `src/DriveFileFetcher.js` | Crawler | Deep-crawl master spreadsheet, extract tab data as Markdown snapshots, discover linked Drive Docs/Sheets from cell URLs, recursively extract with `callWithRetry_()` exponential backoff |
 
 ---
 
@@ -275,6 +325,20 @@ The engine cannot programmatically trigger a NotebookLM refresh — no API exist
 2. Writes an identifying header and timestamp
 3. Persists the new doc ID to `TARGET_DOC_ID` in ScriptProperties
 4. Returns the new ID — the caller seamlessly continues appending to the fresh document
+
+### Execution Time Ceiling (Global Master Clock)
+
+**Problem:** Apps Script enforces a strict 6-minute execution limit per trigger. The pipeline runs up to 6 sequential modules (Drive crawl, Fathom API poll, Fathom Gmail processing, Triple Whale, Sellerboard, confirmation emails). Under original per-module local timers (5 min each), cumulative runtime across all modules could still exceed the 6-minute ceiling despite each module breaking "on time." Additionally, a single `appendToDoc()` write inside a Fathom message loop was observed hanging for ~10 minutes, bypassing loop-level guards entirely.
+
+**Solution:** A three-layer Global Master Clock strategy centered on a single `SCRIPT_START_TIME` set at `runBackgroundSyncs()` entry:
+
+1. **Inter-fetcher barriers** — After each module completes, the orchestrator checks elapsed time against `GLOBAL_MAX_EXECUTION_MS = 240000` (4 minutes). If exceeded, all remaining modules are skipped, preserving a 2-minute safety buffer under the 6-minute hard cap.
+
+2. **Outer loop guard** — At the top of each iteration in `processFathomEmails()`, `processConfirmationEmails()`, and `processDriveMatrixSync()`, a clock check breaks the loop before the next blocking operation.
+
+3. **Mid-message guard** — Inside the Fathom email messages loop, a deadline check runs immediately before `appendToDoc()`. If the clock has expired, an `innerLoopAborted` flag is set, the message is skipped, and the `Processed-Fathom` label is **not** applied to the thread — ensuring unprocessed messages are picked up on the next cycle.
+
+All early exits use `break` (not `return`) so that `LockService` finally-blocks always release the mutex. The global clock is defined at the top of `Code.js` and referenced from all fetchers via the GAS global namespace — no local timers.
 
 ---
 
