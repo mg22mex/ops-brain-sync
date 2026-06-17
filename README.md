@@ -68,85 +68,85 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    Trigger[Time-Driven Trigger<br/>Hourly] --> runBackgroundSyncs
+    Trigger["Time-Driven Trigger<br/>Hourly"] --> runBackgroundSyncs
 
-    runBackgroundSyncs --> Lock{LockService<br/>waitLock 15s}
-    Lock -->|Acquired| SCRIPT_START_TIME[Set global master clock<br/>SCRIPT_START_TIME = now()]
-    Lock -->|Timeout| EXIT1[Exit — skip this cycle]
+    runBackgroundSyncs --> Lock{"LockService<br/>waitLock 15s"}
+    Lock -->|Acquired| START_TIME["Set global master clock<br/>SCRIPT_START_TIME = now()"]
+    Lock -->|Timeout| EXIT1["Exit — skip this cycle"]
 
-    SCRIPT_START_TIME --> Drive
+    START_TIME --> Drive
 
-    subgraph Drive[DriveFileFetcher]
-        D1[processDriveMatrixSync] --> D2[Open master spreadsheet]
-        D2 --> D3[Parse layers → Markdown]
-        D3 --> D4[Save snapshot to Drive folder]
-        D4 --> D5[Discover linked Drive files<br/>from cell URLs]
-        D5 --> D6[Per-link: open + extract + save]
+    subgraph Drive["DriveFileFetcher"]
+        D1["processDriveMatrixSync"] --> D2["Open master spreadsheet"]
+        D2 --> D3["Parse layers → Markdown"]
+        D3 --> D4["Save snapshot to Drive folder"]
+        D4 --> D5["Discover linked Drive files<br/>from cell URLs"]
+        D5 --> D6["Per-link: open + extract + save"]
     end
 
-    Drive --> DC1{Deadline check<br/>> 4 min?}
-    DC1 -->|Yes| DRIVE_EXIT[Skip remaining modules]
+    Drive --> DC1{">= 4 min?"}
+    DC1 -->|Yes| DRIVE_EXIT["Skip remaining modules"]
     DC1 -->|No| FathomAPI
 
-    subgraph FathomAPI[Fathom API Poll]
-        FA1[fetchRecentMeetings] --> FA2[GET api.fathom.ai/v1/meetings<br/>48h lookback]
-        FA2 --> FA3{HTTP 200?}
-        FA3 -->|Yes| FA4[Format meeting summaries]
-        FA3 -->|No| FA5[Log error, return null]
+    subgraph FathomAPI["Fathom API Poll"]
+        FA1["fetchRecentMeetings"] --> FA2["GET api.fathom.ai/v1/meetings<br/>48h lookback"]
+        FA2 --> FA3{"HTTP 200?"}
+        FA3 -->|Yes| FA4["Format meeting summaries"]
+        FA3 -->|No| FA5["Log error, return null"]
     end
 
-    FathomAPI --> DC2{Deadline check<br/>> 4 min?}
-    DC2 -->|Yes| FATHOM_EXIT[Skip remaining modules]
+    FathomAPI --> DC2{">= 4 min?"}
+    DC2 -->|Yes| FATHOM_EXIT["Skip remaining modules"]
     DC2 -->|No| FathomEmail
 
-    subgraph FathomEmail[Fathom Gmail Processing]
-        FE1[processFathomEmails] --> FE2[Search Gmail:<br/>subject:Recap for<br/>-label:Processed-Fathom]
-        FE2 --> FE3{Threads found?}
-        FE3 -->|Yes| FE4[Per-thread: get messages]
-        FE4 --> FE5{Per-message:<br/>deadline OK?}
-        FE5 -->|Yes| FE6[Format + appendToDoc]
-        FE6 --> FE7[Mid-message guard:<br/>deadline check<br/>before append]
-        FE7 -->|Deadline hit| FE8[Set innerLoopAborted<br/>break — skip label]
+    subgraph FathomEmail["Fathom Gmail Processing"]
+        FE1["processFathomEmails"] --> FE2["Search Gmail:<br/>subject:Recap for<br/>-label:Processed-Fathom"]
+        FE2 --> FE3{"Threads found?"}
+        FE3 -->|Yes| FE4["Per-thread: get messages"]
+        FE4 --> FE5{"Per-message:<br/>deadline OK?"}
+        FE5 -->|Yes| FE6["Format + appendToDoc"]
+        FE6 --> FE7["Mid-message guard:<br/>deadline check<br/>before append"]
+        FE7 -->|Deadline hit| FE8["Set innerLoopAborted,<br/>break, skip label"]
         FE7 -->|OK| FE5
-        FE5 -->|No| FE9{Done all msgs?}
-        FE9 -->|Yes| FE10[Apply Processed-Fathom label]
+        FE5 -->|No| FE9{"Done all msgs?"}
+        FE9 -->|Yes| FE10["Apply Processed-Fathom label"]
         FE9 -->|No| FE5
-        FE3 -->|No| FE11[Return null]
+        FE3 -->|No| FE11["Return null"]
     end
 
-    FathomEmail --> DC3{Deadline check<br/>> 4 min?}
-    DC3 -->|Yes| TW_EXIT[Skip remaining modules]
+    FathomEmail --> DC3{">= 4 min?"}
+    DC3 -->|Yes| TW_EXIT["Skip remaining modules"]
     DC3 -->|No| TW
 
-    subgraph TW[Triple Whale Sync]
-        T1[fetchTripleWhalePerformance] --> T2[POST api.triplewhale.com/v2/...]
-        T2 --> T3{HTTP 200?}
-        T3 -->|Yes| T4[Parse metrics JSON]
-        T3 -->|No| T5[Log error, return null]
-        T4 --> T6[Format Markdown table]
+    subgraph TW["Triple Whale Sync"]
+        T1["fetchTripleWhalePerformance"] --> T2["POST api.triplewhale.com/v2/..."]
+        T2 --> T3{"HTTP 200?"}
+        T3 -->|Yes| T4["Parse metrics JSON"]
+        T3 -->|No| T5["Log error, return null"]
+        T4 --> T6["Format Markdown table"]
     end
 
-    TW --> DC4{Deadline check<br/>> 4 min?}
-    DC4 -->|Yes| SB_EXIT[Skip remaining modules]
+    TW --> DC4{">= 4 min?"}
+    DC4 -->|Yes| SB_EXIT["Skip remaining modules"]
     DC4 -->|No| SB
 
-    subgraph SB[Sellerboard Sync]
-        S1[fetchSellerboardDaily] --> S2[GET CSV from<br/>SELLERBOARD_DAILY_LINK]
-        S2 --> S3{HTTP 200?}
-        S3 -->|Yes| S4[Parse CSV headers + rows]
-        S3 -->|No| S5[Log error, return null]
-        S4 --> S6[Extract last non-empty row]
-        S6 --> S7[Format Markdown table]
+    subgraph SB["Sellerboard Sync"]
+        S1["fetchSellerboardDaily"] --> S2["GET CSV from<br/>SELLERBOARD_DAILY_LINK"]
+        S2 --> S3{"HTTP 200?"}
+        S3 -->|Yes| S4["Parse CSV headers + rows"]
+        S3 -->|No| S5["Log error, return null"]
+        S4 --> S6["Extract last non-empty row"]
+        S6 --> S7["Format Markdown table"]
     end
 
-    SB --> DC5{Deadline check<br/>> 4 min?}
-    DC5 -->|Yes| CONFIRM_EXIT[Skip confirmation emails]
+    SB --> DC5{">= 4 min?"}
+    DC5 -->|Yes| CONFIRM_EXIT["Skip confirmation emails"]
     DC5 -->|No| Confirm
 
-    subgraph Confirm[Confirmation Emails]
-        C1[processConfirmationEmails] --> C2[Search Gmail:<br/>confirmation/order/reference]
-        C2 --> C3[Per-thread: format + append]
-        C3 --> C4[Retry on failure]
+    subgraph Confirm["Confirmation Emails"]
+        C1["processConfirmationEmails"] --> C2["Search Gmail:<br/>confirmation/order/reference"]
+        C2 --> C3["Per-thread: format + append"]
+        C3 --> C4["Retry on failure"]
     end
 
     Confirm --> Append
@@ -156,16 +156,16 @@ flowchart TD
     DC4 -->|Yes| Append
     DC5 -->|Yes| Append
 
-    subgraph Append[Doc Append Pipeline]
-        A1[Rollover check] --> A2{Word count<br/>>= 380K?}
-        A2 -->|No| A3[Use current doc]
-        A2 -->|Yes| A4[Create YYYY-MM doc]
-        A4 --> A5[Update TARGET_DOC_ID<br/>in ScriptProperties]
-        A3 --> A6[appendToDoc]
+    subgraph Append["Doc Append Pipeline"]
+        A1["Rollover check"] --> A2{"Word count<br/>>= 380K?"}
+        A2 -->|No| A3["Use current doc"]
+        A2 -->|Yes| A4["Create YYYY-MM doc"]
+        A4 --> A5["Update TARGET_DOC_ID<br/>in ScriptProperties"]
+        A3 --> A6["appendToDoc"]
         A5 --> A6
     end
 
-    Append --> Done[runBackgroundSyncs complete]
+    Append --> Done["runBackgroundSyncs complete"]
 ```
 
 ---
