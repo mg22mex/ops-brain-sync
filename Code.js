@@ -65,7 +65,8 @@ function cleanSlackUserMentions(text) {
     'U04PH549Z3N':  'Paula Bacolod',
     'U08E1C77J77':  'Arqam',
     'U03SW53P95E':  'Mollie Cutillo',
-    'U0AMTGG4XRD':  'Marco Gastelum'
+    'U0AMTGG4XRD':  'Marco Gastelum',
+    'U025M6KHAPN':  'Margo Andros'
   };
 
   var cleanedText = text;
