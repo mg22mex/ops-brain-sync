@@ -21,6 +21,9 @@ function processFathomEmails() {
   }
 
   try {
+    // Track execution time for early-exit guard (5-minute ceiling)
+    var startTime = new Date().getTime();
+    var TIME_LIMIT_MS = 300000;
     var BATCH_SIZE = 5;
 
     // Ensure the tracking label exists (idempotent — create only if missing)
@@ -55,16 +58,15 @@ function processFathomEmails() {
     var processedCount = 0;
 
     for (var t = 0; t < threads.length; t++) {
-      // Global master clock guard — exit before the 4-minute platform ceiling
-      if (new Date().getTime() - SCRIPT_START_TIME > GLOBAL_MAX_EXECUTION_MS) {
-        console.log('[FathomFetcher] Global deadline reached (%dms) — exiting early after %d thread(s) processed.',
-          GLOBAL_MAX_EXECUTION_MS, processedCount);
+      // Time-remaining guard: exit before 6-minute hard limit to save cleanly
+      if (new Date().getTime() - startTime > TIME_LIMIT_MS) {
+        console.log('[FathomFetcher] Time limit reached (%dms) — exiting early after %d thread(s) processed.',
+          TIME_LIMIT_MS, processedCount);
         break;
       }
 
       var thread = threads[t];
       var messages = thread.getMessages();
-      var innerLoopAborted = false;
 
       for (var m = 0; m < messages.length; m++) {
         var msg = messages[m];
@@ -91,14 +93,6 @@ function processFathomEmails() {
         };
         var markdown = formatAsMarkdown(payload);
 
-        // Mid-message deadline guard — DocAppender writes can hang for minutes
-        if (new Date().getTime() - SCRIPT_START_TIME > GLOBAL_MAX_EXECUTION_MS) {
-          console.log('[FathomFetcher] Global deadline reached mid-message (%dms) — aborting message "%s" and breaking thread.',
-            GLOBAL_MAX_EXECUTION_MS, msg.getSubject());
-          innerLoopAborted = true;
-          break;
-        }
-
         try {
           var docId = safeCheckAndRollover_(targetDocId);
           appendToDoc(docId, markdown);
@@ -112,16 +106,11 @@ function processFathomEmails() {
         }
       }
 
-      // Only apply the label if we finished processing this thread — skip if aborted mid-flight
-      if (!innerLoopAborted) {
-        try {
-          thread.addLabel(label);
-        } catch (labelErr) {
-          console.warn('[FathomFetcher] Could not apply label to thread: %s', labelErr.message);
-        }
-      } else {
-        console.log('[FathomFetcher] Skipping label for thread "%s" — mid-message abort prevents clean completion.',
-          thread.getFirstMessageSubject());
+      // Apply the Processed-Fathom label to the entire thread
+      try {
+        thread.addLabel(label);
+      } catch (labelErr) {
+        console.warn('[FathomFetcher] Could not apply label to thread: %s', labelErr.message);
       }
     }
 

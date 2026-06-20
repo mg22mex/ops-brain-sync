@@ -42,6 +42,9 @@ function processDriveMatrixSync(folderId, spreadsheetId) {
     if (!folderId || !spreadsheetId) throw new Error('DriveFileFetcher: Missing arguments');
 
     try {
+      var startTime = new Date().getTime();
+      var TIME_LIMIT_MS = 300000;
+
       var destinationFolder = callWithRetry_(function() {
         return DriveApp.getFolderById(folderId);
       }, 'getFolderById(' + folderId + ')');
@@ -63,10 +66,10 @@ function processDriveMatrixSync(folderId, spreadsheetId) {
       console.log('[DriveCrawler] Discovered %d potential companion links to sync.', discoveredLinks.length);
 
       for (var i = 0; i < discoveredLinks.length; i++) {
-        // Global master clock guard — exit before the 4-minute platform ceiling
-        if (new Date().getTime() - SCRIPT_START_TIME > GLOBAL_MAX_EXECUTION_MS) {
-          console.log('[DriveCrawler] Global deadline reached (%dms) — exiting early after %d of %d links.',
-            GLOBAL_MAX_EXECUTION_MS, i, discoveredLinks.length);
+        // Time-remaining guard: exit before 6-minute hard limit
+        if (new Date().getTime() - startTime > TIME_LIMIT_MS) {
+          console.log('[DriveCrawler] Time limit reached (%dms) — exiting early after %d of %d links.',
+            TIME_LIMIT_MS, i, discoveredLinks.length);
           break;
         }
 
