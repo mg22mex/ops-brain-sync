@@ -39,7 +39,7 @@ function processFathomEmails() {
     }
 
     // Search for unprocessed Fathom recap threads, capped at batch size
-    var query = 'subject:"Recap for" -label:Processed-Fathom';
+    var query = 'from:fathom (subject:"Recap for" OR subject:"Recap of your meeting") -label:Processed-Fathom';
     var threads = GmailApp.search(query, 0, BATCH_SIZE);
 
     if (threads.length === 0) {

@@ -1,0 +1,12 @@
+cat << 'EOF' > .claspignore
+# Ignore Node.js automation scripts
+run_apps_script_ui.js
+node_modules/
+package.json
+package-lock.json
+
+# Ignore system/git files
+.git/
+.gitignore
+README.md
+EOF

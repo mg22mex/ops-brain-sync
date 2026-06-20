@@ -1,5 +1,8 @@
 /**
  * ops-brain-sync — Google Apps Script Web App
+ *
+ * Entry points: doGet / doPost (webhooks). Background jobs live in BackgroundSync.js
+ * (run installBackgroundTriggers once after deploy).
  */
 
 // 1. Raw configuration fallbacks
@@ -35,10 +38,20 @@ function getValidSpreadsheetId() {
   var rawId = PropertiesService.getScriptProperties().getProperty('MASTER_SPREADSHEET_ID') || DEFAULT_MASTER_SPREADSHEET_ID;
   var sanitized = sanitizeSpreadsheetId(rawId);
   try {
-    var sheet = SpreadsheetApp.openById(sanitized);
+    SpreadsheetApp.openById(sanitized);
     return sanitized;
   } catch (e) {
-    throw new Error('Cannot access spreadsheet. Please run fixSpreadsheetId() function');
+    throw new Error('Cannot access spreadsheet. Check MASTER_SPREADSHEET_ID in Script Properties.');
+  }
+}
+
+/** Safe variant for background jobs — logs and returns null instead of throwing. */
+function tryGetValidSpreadsheetId() {
+  try {
+    return getValidSpreadsheetId();
+  } catch (e) {
+    console.error('[Config] Spreadsheet unavailable: %s', e.message);
+    return null;
   }
 }
 
@@ -102,81 +115,6 @@ function doPost(e) {
   }
 }
 
-// 3. Background Sync Engine with Concurrency Safeguard Lock
-function runBackgroundSyncs() {
-  var executionLock = LockService.getScriptLock();
-  try {
-    // Wait up to 15 seconds for any running background sync to clear out completely
-    executionLock.waitLock(15000);
-  } catch (lockError) {
-    console.warn('[Background Engine] An instance is already actively executing. Exiting this cycle to prevent overlaps.');
-    return;
-  }
-
-  console.log('[Background] ========== STARTING SYNC ==========');
-  
-  var masterSpreadsheetId = getValidSpreadsheetId();
-  var targetDocId = PropertiesService.getScriptProperties().getProperty('TARGET_DOC_ID') || DEFAULT_TARGET_DOC_ID;
-  var notebookFolderId = PropertiesService.getScriptProperties().getProperty('NOTEBOOK_SOURCE_FOLDER_ID') || DEFAULT_NOTEBOOK_SOURCE_FOLDER_ID;
-
-  // Master Matrix Sync
-  try { 
-    processDriveMatrixSync(notebookFolderId, masterSpreadsheetId); 
-  } catch (err) { 
-    console.error('Drive Sync error: ' + err.message); 
-  }
-  
-  // Fathom Polling Sync
-  try {
-    var fathomMarkdown = fetchRecentMeetings();
-    if (fathomMarkdown) {
-      var activeDocId = safeCheckAndRollover_(targetDocId);
-      appendToDoc(activeDocId, fathomMarkdown);
-    }
-  } catch (err) { 
-    console.error('Fathom Sync error: ' + err.message); 
-  }
-
-  // Email Monitor For Fathom
-  try {
-    processFathomEmails();
-  } catch (err) { 
-    console.error('Fathom Email Monitor error: ' + err.message); 
-  }
-
-  // Triple Whale Sync
-  try {
-    var twMarkdown = fetchTripleWhalePerformance();
-    if (twMarkdown) {
-      var activeDocId = safeCheckAndRollover_(targetDocId);
-      appendToDoc(activeDocId, twMarkdown);
-    }
-  } catch (err) { 
-    console.error('TW Sync error: ' + err.message); 
-  }
-
-  // Sellerboard Sync
-  try {
-    var sbMarkdown = fetchSellerboardDaily();
-    if (sbMarkdown) {
-      var activeDocId = safeCheckAndRollover_(targetDocId);
-      appendToDoc(activeDocId, sbMarkdown);
-    }
-  } catch (err) { 
-    console.error('SB Sync error: ' + err.message); 
-  }
-  
-  // Operational Confirmations Email Sync
-  try {
-    processConfirmationEmails();
-  } catch (err) { 
-    console.error('Confirmation Email Sync error: ' + err.message); 
-  }
-  
-  console.log('[Background] ========== SYNC COMPLETE ==========');
-  executionLock.releaseLock();
-}
-
 /**
  * Robust Self-Healing Rollover Safety Engine
  */
@@ -198,57 +136,6 @@ function safeCheckAndRollover_(currentDocId) {
       console.error('[Rollover Safety] Total lock environment reached. Falling back to base configurations: ' + emergencyErr.message);
       return currentDocId;
     }
-  }
-}
-
-// 4. Fathom processing moved to src/FathomFetcher.js
-
-// 5. General Confirmation and Reference Monitor
-function processConfirmationEmails() {
-  var lock = LockService.getScriptLock();
-  try {
-    lock.waitLock(30000);
-  } catch (e) {
-    return;
-  }
-
-  try {
-    var startTime = new Date().getTime();
-    var TIME_LIMIT_MS = 300000;
-    var searchQuery = 'subject:(confirmation OR order OR reference OR "nrf" OR "color reference")';
-    var threads = GmailApp.search(searchQuery, 0, 5);
-    var targetDocId = PropertiesService.getScriptProperties().getProperty('TARGET_DOC_ID') || DEFAULT_TARGET_DOC_ID;
-
-    for (var i = 0; i < threads.length; i++) {
-      // Time-remaining guard: exit before 6-minute hard limit
-      if (new Date().getTime() - startTime > TIME_LIMIT_MS) {
-        console.log('[ConfirmationEmails] Time limit reached (%dms) — exiting early after %d thread(s).',
-          TIME_LIMIT_MS, i);
-        break;
-      }
-      var messages = threads[i].getMessages();
-      var msg = messages[messages.length - 1]; 
-      
-      var payload = { 
-        'source': 'gmail_confirmation', 
-        'content': msg.getPlainBody(), 
-        'metadata': { 'title': msg.getSubject() } 
-      };
-      var markdown = formatAsMarkdown(payload);
-      
-      try {
-        var docId = safeCheckAndRollover_(targetDocId);
-        appendToDoc(docId, markdown);
-      } catch (err) {
-        Utilities.sleep(3000);
-        try {
-          var retryDocId = safeCheckAndRollover_(targetDocId);
-          appendToDoc(retryDocId, markdown);
-        } catch (retryErr) {}
-      }
-    }
-  } finally {
-    lock.releaseLock();
   }
 }
 

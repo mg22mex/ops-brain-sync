@@ -50,7 +50,13 @@ function fetchTripleWhalePerformance() {
     return null;
   }
 
-  var responseData = JSON.parse(response.getContentText());
+  var responseData;
+  try {
+    responseData = JSON.parse(response.getContentText());
+  } catch (parseErr) {
+    console.error('[TripleWhaleFetcher] Invalid JSON response: %s', parseErr.message);
+    return null;
+  }
   
   // Dynamically flatten the response object to find all data fields
   var flatMetrics = {};

@@ -1,6 +1,6 @@
 # Architecture Document — ops-brain-sync
 
-> **Version:** 1.2.0  
+> **Version:** 1.3.0  
 > **Runtime:** Google Apps Script (V8 / ES5+)  
 > **Deployment Platform:** Clasp CLI → Google Workspace  
 > **Canonical Timezone:** America/New_York
@@ -35,13 +35,13 @@ We embrace this constraint with a **filesystem-as-module-boundary** convention: 
 ### 1.2 Fail-Stop for Webhooks, Fail-Soft for Polling
 
 - **Webhook path (`doPost`):** Fail-stop. If any step throws (parse error, doc unavailable, rollover crash), the entire request returns a `500` with the error message. Slack or the upstream sender will retry.
-- **Polling path (`runBackgroundSyncs`):** Fail-soft. Each fetcher runs in its own `try/catch` block. A Fathom API outage does not block Triple Whale or Sellerboard data. The orchestrator logs each source's outcome and returns a consolidated summary.
+- **Background jobs (`BackgroundSync.js`):** Fail-soft per handler. Each split trigger wraps its work in `try/catch`. A Triple Whale outage does not block Fathom Gmail processing because they run in separate executions.
 
 ### 1.3 Self-Healing Capacity Boundaries
 
 The system actively prevents itself from exceeding three hard limits:
 - **Document word count** (~380K → rollover at 500K ceiling)
-- **Execution duration** (6-minute Apps Script hard cap → 4-minute global master clock with inter-fetcher barriers)
+- **Execution duration** (6-minute Apps Script hard cap → split triggers + per-job batch/time guards in `BackgroundSync.js`)
 - **Payload size** (~15K char truncation + whitespace compression)
 
 ---
@@ -53,17 +53,17 @@ The system actively prevents itself from exceeding three hard limits:
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                      EXECUTION BOUNDARY                              │
-│  Apps Script Runtime (V8) — max 6 min, enforced at 4 min globally   │
+│  Apps Script Runtime (V8) — max 6 min per trigger execution          │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                      │
 │  ┌──────────────────────────────────────────────────────────────┐   │
-│  │                    ENTRY POINTS (Code.js)                     │   │
+│  │              ENTRY POINTS (Code.js + BackgroundSync.js)     │   │
 │  │                                                              │   │
-│  │  doGet(e)        doPost(e)         runBackgroundSyncs()      │   │
-│  │  ─────────       ─────────         ────────────────────      │   │
-│  │  Health-check    Webhook ingress   Scheduled orchestrator     │   │
-│  │  JSON response   JSON response     4-min global master clock  │   │
-│  │                                   Break-based early exits     │   │
+│  │  doGet(e)   doPost(e)   runFathomEmailSync (15m)             │   │
+│  │  doPost     webhooks    runConfirmationEmailSync (1h)        │   │
+│  │                         runMetricsSync (6h)                    │   │
+│  │                         runDriveMatrixSyncJob (daily 2 AM)     │   │
+│  │  WeeklyReporter.gs: postWeeklyReport (Mon 11 AM)             │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                        │            │          │                     │
 │          ┌─────────────┘            │          └──────────────┐     │
@@ -78,7 +78,7 @@ The system actively prevents itself from exceeding three hard limits:
 │  ┌──────────────────────────────────────────┐  │ SellerboardFetch│ │
 │  │             DocAppender                   │  │ DriveFileFetch │ │
 │  │  appendToDoc(docId, markdown)           │  │ Confirmation-   │ │
-│  │  appendSlackToDailyFile(folderId, md)   │  │ Emails (Code.js)│ │
+│  │  appendSlackToDailyFile(folderId, md)   │  │ Emails (BgSync) │ │
 │  └──────────────────────────────────────────┘  └─────────────────┘ │
 │                              │                        │             │
 │                              ▼                        ▼             │
@@ -104,17 +104,23 @@ The system actively prevents itself from exceeding three hard limits:
 
 ```
 Code.js
-  ├── src/WebhookParser.js      (called by doPost)
-  ├── src/MarkdownFormatter.js   (called by doPost)
-  ├── src/DocAppender.js         (called by doPost + runBackgroundSyncs)
-  ├── src/RolloverManager.js     (called by doPost + runBackgroundSyncs)
-  ├── src/FathomFetcher.js       (called by runBackgroundSyncs)
-  ├── src/TripleWhaleFetcher.js  (called by runBackgroundSyncs)
-  ├── src/SellerboardFetcher.js  (called by runBackgroundSyncs)
-  └── src/DriveFileFetcher.js    (called by runBackgroundSyncs)
+  ├── WebhookParser.js       (called by doPost)
+  ├── MarkdownFormatter.js   (called by doPost)
+  ├── DocAppender.js         (called by doPost + background jobs)
+  └── RolloverManager.js     (called by doPost + background jobs)
+
+BackgroundSync.js
+  ├── FathomFetcher.js       (runFathomEmailSync)
+  ├── TripleWhaleFetcher.js  (runMetricsSync)
+  ├── SellerboardFetcher.js  (runMetricsSync)
+  ├── DriveFileFetcher.js    (runDriveMatrixSyncJob)
+  └── processConfirmationEmails_() (runConfirmationEmailSync)
+
+WeeklyReporter.js
+  └── postWeeklyReport (installWeeklyReportTrigger — Mon 11 AM ET)
 ```
 
-There are **no circular dependencies**. RolloverManager and DocAppender are leaf modules with zero internal dependencies. All six `src/` modules are pure utility libraries — they export functions consumed by `Code.js`'s three entry points.
+There are **no circular dependencies**. `runBackgroundSyncs()` is deprecated (no-op).
 
 ---
 
@@ -223,54 +229,39 @@ Hey team — @Diego Marquez can you review the NRF numbers?
 
 **After appendToDoc:** The doc now has three new paragraphs — a `HEADING3` header line, several `NORMAL` metadata lines, a `SUBTITLE` divider, the content, and a closing divider.
 
-### 3.3 Polling Path (runBackgroundSyncs)
+### 3.3 Background Jobs (BackgroundSync.js)
 
-The orchestrator runs sequentially, with **inter-fetcher deadline checks** between each module:
+Background sync is split into **independent time-driven handlers**, each with its own schedule and execution budget. Jobs may overlap; Gmail processors serialize via `LockService`.
 
 ```
-runBackgroundSyncs()
+installBackgroundTriggers()  ← run once after deploy
 │
-├── LockService.getScriptLock().waitLock(15000) — prevents concurrent runs
+├── runFathomEmailSync          every 15 min
+│     └── processFathomEmails()
+│           ├── LockService.waitLock(30000)
+│           ├── Gmail: Fathom recaps -label:Processed-Fathom (batch 5)
+│           ├── appendToDoc + Processed-Fathom label
+│           └── TIME_LIMIT_MS = 300000 (5 min local guard)
 │
-├── SCRIPT_START_TIME = now()  ← global master clock (GLOBAL_MAX_EXECUTION_MS = 240000)
+├── runConfirmationEmailSync    every 1 hour
+│     └── processConfirmationEmails_()
+│           ├── LockService.waitLock(30000)  ← same script lock as Fathom
+│           ├── Gmail: confirmation/order/reference -label:Processed-Confirmation
+│           └── TIME_LIMIT_MS = 270000
 │
-├── [1] DriveFileFetcher.processDriveMatrixSync(folderId, spreadsheetId)
-│     ├── callWithRetry_(openById) × N  (exponential backoff, 3 attempts)
-│     ├── Parse master spreadsheet → save snapshot to Drive
-│     ├── Discover linked files → crawl each (with per-link time guard)
-│     └── │
-│         ▼ deadline check → skip remaining fetchers if past 4 min
+├── runMetricsSync              every 6 hours
+│     ├── fetchTripleWhalePerformance() → appendToDoc
+│     └── fetchSellerboardDaily() → appendToDoc
 │
-├── [2] FathomFetcher.fetchRecentMeetings() — API poll fallback
-│     └── │
-│         ▼ deadline check
-│
-├── [3] FathomFetcher.processFathomEmails() — Gmail primary path
-│     ├── Search Gmail: subject:"Recap for" -label:Processed-Fathom
-│     ├── Per-thread: messages → format → appendToDoc()
-│     ├── Mid-message deadline guard (innerLoopAborted flag)
-│     ├── Thread label only applied if inner loop completed cleanly
-│     └── │
-│         ▼ deadline check
-│
-├── [4] TripleWhaleFetcher.fetchTripleWhalePerformance()
-│     └── │
-│         ▼ deadline check
-│
-├── [5] SellerboardFetcher.fetchSellerboardDaily()
-│     └── │
-│         ▼ deadline check
-│
-├── [6] Code.js.processConfirmationEmails()
-│     └── Gmail search: confirmation/order/reference emails
-│         (time-guarded per thread, references global clock)
-│
-└── LockService.releaseLock()
+└── runDriveMatrixSyncJob       daily 2:00 AM ET
+      └── processDriveMatrixSync(notebookFolderId, spreadsheetId)
+
+runBackgroundSyncs()  ← DEPRECATED (no-op + console warning)
 ```
 
-**Deadline behavior:** When `new Date().getTime() - SCRIPT_START_TIME > GLOBAL_MAX_EXECUTION_MS`, the orchestrator logs a message and skips all remaining modules. Within loops, `break` is used instead of `return` so that LockService finally blocks and Gmail label operations execute normally — preserving consistent state.
+**Overlap behavior:** If Fathom and confirmation jobs run simultaneously, the second waits 30s for the script lock, then skips with `Lock busy — skipping cycle` if still held. Metrics and Drive jobs do not use the Gmail lock; doc writes rely on `appendToDoc` retry backoff.
 
-Each module independently calls `checkAndRolloverIfNeeded_()` before appending, because the document state may change between iterations (e.g., Fathom pushes past the rollover threshold, then Triple Whale would need the new doc).
+**Weekly digest:** `postWeeklyReport` (Monday 11 AM ET) is registered separately via `installWeeklyReportTrigger()` in `WeeklyReporter.js`.
 
 ---
 
@@ -536,23 +527,21 @@ doPost entry
 
 The chain is linear and synchronous. Any uncaught exception propagates to the outer `try/catch` which logs the error message and returns `500` with the error in the body. Slack will retry failed deliveries up to 3 times with exponential backoff.
 
-### 6.2 Polling Path (runBackgroundSyncs)
+### 6.2 Background Jobs (BackgroundSync.js)
 
-Each fetcher is isolated:
+Each handler is isolated — failures do not cascade across triggers:
+
 ```
-TRY   → fetcher function
-         ├── API key missing   → warn, return null
-         ├── HTTP error        → log status + body, return null
-         ├── Parse failure     → throws to catch
-         └── Success           → return Markdown
-
-CATCH → log error message, push '{source}:error' to results
+runFathomEmailSync / runConfirmationEmailSync / runMetricsSync / runDriveMatrixSyncJob
+  TRY   → job-specific work
+          ├── API key missing   → warn, return null (metrics)
+          ├── HTTP error        → log, return null
+          ├── Lock busy         → warn, skip cycle (Gmail jobs)
+          └── Success           → append + label where applicable
+  CATCH → log error message; execution still Completes (no 6-min cascade)
 ```
 
-A single fetcher failure never halts the orchestrator. The `results` array provides a post-run audit trail:
-- `fathom:ok` / `fathom:no-new-data` / `fathom:error`
-- `triplewhale:ok` / `triplewhale:no-data` / `triplewhale:error`
-- `sellerboard:ok` / `sellerboard:no-data` / `sellerboard:error`
+`runBackgroundSyncs` is deprecated and performs no work.
 
 ### 6.3 Document-Level Errors
 
@@ -572,39 +561,32 @@ A single fetcher failure never halts the orchestrator. The `results` array provi
 
 | Resource | Free Tier Limit | ops-brain-sync Impact |
 |----------|-----------------|----------------------|
-| Triggers total | 20 | 1 (runBackgroundSyncs) |
-| Trigger duration | 6 min / execution | ~60–180s typical; 4-min global master clock enforces hard break |
+| Triggers total | 20 | 5 background + 1 weekly (`installBackgroundTriggers` + `installWeeklyReportTrigger`) |
+| Trigger duration | 6 min / execution | Per-job budgets; Drive matrix is the heaviest (daily off-hours) |
 | UrlFetch calls / day | 20,000 | 3–5 per sync run (Fathom API + TW + SB + Gmail searches) |
 | UrlFetch timeout | 60s | Default (each fetcher call is < 10s) |
 | Document size | 50 MB | ~380K words ≈ ~2.5 MB; rollover preempts cap |
 | Gmail search/read | 20,000 quota | ~5–10 per run (Fathom emails + confirmation emails) |
 | Script Properties | 500 KB total | ~1 KB used (7 keys) |
 
-### 7.2 Time Budget Allocation
+### 7.2 Time Budget Allocation (per job)
 
-Based on observed execution profiles with the 4-minute global ceiling:
+| Job | Typical duration | Guard |
+|-----|------------------|-------|
+| `runFathomEmailSync` | 10–120s | 5 min loop guard; batch 5 threads |
+| `runConfirmationEmailSync` | 5–30s | 4.5 min loop guard; batch 5 threads |
+| `runMetricsSync` | 5–15s | Two API fetches + doc appends |
+| `runDriveMatrixSyncJob` | 15–300s+ | Daily off-hours; loop guards in DriveFileFetcher |
 
-| Operation | Time | Notes |
-|-----------|------|-------|
-| DriveFileFetcher deep crawl | ~15–60s | Depends on linked file count and size |
-| Fathom API poll | ~5–15s | Depends on meeting count and transcript size |
-| Fathom Gmail processing | ~10–120s | Per-thread append; worst-case single message can approach the global ceiling |
-| Triple Whale API call | ~3–8s | Small JSON payload |
-| Sellerboard CSV fetch + parse | ~2–5s | Depends on CSV row count |
-| Confirmation email processing | ~5–30s | Per-email append |
-| Rollover check | ~1–3s | Opens doc, reads body text |
+Splitting jobs avoids the previous failure mode where a Drive crawl + Fathom Gmail + metrics in one run routinely exceeded 6 minutes (~80% error rate).
 
-**Typical total:** 60–240s. The 4-min global ceiling (240,000 ms) provides a 2-minute safety buffer under the 6-min Apps Script hard limit to account for cumulative overhead, retry backoff, and unusually large Fathom transcripts.
+### 7.3 Concurrency & Locking
 
-### 7.3 Global Master Clock Strategy
+1. **Gmail script lock** — `runFathomEmailSync` and `runConfirmationEmailSync` share `LockService.getScriptLock()` (30s wait). Overlap → skip cycle, retry on next interval. Labels applied only after successful append.
 
-The 4-minute ceiling is enforced at three levels:
+2. **Doc write retry** — `appendToDoc` exponential backoff (3 attempts) when metrics/webhooks write during a Gmail job.
 
-1. **Inter-fetcher barriers** in `runBackgroundSyncs()` — after each module completes, the orchestrator checks the global clock and skips all remaining modules if exceeded
-2. **Outer loop guard** at the top of each thread/iteration in FathomFetcher, DriveFileFetcher, and confirmation email processing
-3. **Mid-message guard** inside the Fathom email messages loop — immediately before the `appendToDoc()` call, preventing a single slow write from blocking execution indefinitely
-
-All exits use `break` (not `return`), ensuring LockService finally blocks always release the mutex and Gmail label operations execute before the execution ends.
+3. **Independent jobs** — Metrics and Drive matrix do not hold the Gmail lock.
 
 ---
 
@@ -671,10 +653,22 @@ curl -s -X POST https://script.google.com/macros/s/{DEPLOY_ID}/exec \
 
 ### 9.2 Trigger Verification
 
-After installing `installBackgroundTrigger()`, verify via:
-1. Open the script in the Apps Script editor (`clasp open`)
-2. Click the clock icon (Triggers) in the sidebar
-3. Confirm `runBackgroundSyncs` appears with schedule: **Every day (9:15–10:15 AM)**
+After `clasp push`, run once from the Apps Script editor:
+
+1. `installBackgroundTriggers()` in `BackgroundSync.gs`
+2. `installWeeklyReportTrigger()` in `WeeklyReporter.gs` (if not already installed)
+
+Verify via the **Triggers** page (clock icon):
+
+| Handler | Schedule |
+|---------|----------|
+| `runFathomEmailSync` | Every 15 minutes |
+| `runConfirmationEmailSync` | Every hour |
+| `runMetricsSync` | Every 6 hours |
+| `runDriveMatrixSyncJob` | Daily ~2:00 AM ET |
+| `postWeeklyReport` | Monday 11:00 AM ET |
+
+Confirm **no** `runBackgroundSyncs` trigger remains. Check **Executions** for trigger-sourced runs with status **Completed**.
 
 ---
 
@@ -689,18 +683,20 @@ ops-brain-sync/
 ├── appsscript.json          # GAS manifest (timezone, runtime, webapp config)
 ├── package.json             # Node dependencies (clasp)
 ├── CLAUDE.md                # Project instructions for AI coding assistant
-├── README.md                # This file
+├── README.md                # User-facing overview + quick start
 ├── ARCHITECTURE.md          # This document
-├── Code.js                  # Entry points: doGet, doPost, runBackgroundSyncs, installBackgroundTrigger, processConfirmationEmails
-└── src/
-    ├── WebhookParser.js     # Payload router + content extractor
-    ├── MarkdownFormatter.js # Markdown transformer with ET timestamps
-    ├── DocAppender.js       # Google Doc write operations (with exponential backoff retry)
-    ├── RolloverManager.js   # Word-count guard + monthly rollover
-    ├── FathomFetcher.js     # Gmail-based Fathom processing + API polling fallback (with global clock guards)
-    ├── TripleWhaleFetcher.js# Triple Whale analytics polling
-    ├── SellerboardFetcher.js# Sellerboard CSV fetch + parse
-    └── DriveFileFetcher.js  # Master Matrix deep crawl + linked file extraction (with retry + time guard)
+├── src/
+│   ├── Code.js              # Webhooks: doGet, doPost; shared config + rollover
+│   ├── BackgroundSync.js    # Split triggers + installBackgroundTriggers()
+│   ├── WeeklyReporter.js    # Monday Slack digest + installWeeklyReportTrigger()
+│   ├── WebhookParser.js     # Payload router + content extractor
+│   ├── MarkdownFormatter.js # Markdown transformer with ET timestamps
+│   ├── DocAppender.js       # Google Doc writes (exponential backoff retry)
+│   ├── RolloverManager.js   # Word-count guard + monthly rollover
+│   ├── FathomFetcher.js     # Gmail Fathom recaps (Processed-Fathom label)
+│   ├── TripleWhaleFetcher.js# Triple Whale analytics polling
+│   ├── SellerboardFetcher.js# Sellerboard CSV fetch + parse
+│   └── DriveFileFetcher.js  # Master Matrix deep crawl + linked file extraction
 ```
 
 ### 10.2 Push/Pull Workflow
@@ -726,7 +722,7 @@ Local edits → clasp push → Apps Script (remote) → clasp deploy → Web App
 | **RAG** | Retrieval-Augmented Generation — NotebookLM's mechanism for grounding LLM responses in user-provided source documents |
 | **GAS** | Google Apps Script — the runtime environment |
 | **Rollover** | Automatic creation of a new monthly document when word count approaches the 500K ceiling |
-| **Dedup** | Deduplication — tracking processed Fathom meeting IDs to avoid re-appending |
+| **Dedup** | Deduplication — Gmail labels (`Processed-Fathom`, `Processed-Confirmation`) prevent re-processing |
 | **LockService** | Apps Script mutex for preventing concurrent write conflicts |
 | **01010101** | Slack internal base-10 to base-34 encoding used in user/team IDs |
 
@@ -739,3 +735,4 @@ Local edits → clasp push → Apps Script (remote) → clasp deploy → Web App
 | 1.0.0 | 2026-06-14 | Initial release — Slack + Fathom webhooks, Triple Whale + Sellerboard polling, rollover management |
 | 1.1.0 | 2026-06-17 | **Global master clock refactor** — Replaced per-module local timers (5 min each) with single `SCRIPT_START_TIME` + `GLOBAL_MAX_EXECUTION_MS = 240000` at `runBackgroundSyncs()` entry; inter-fetcher deadline barriers between each module; all loop guards reference global clock via `break`-based early exits |
 | 1.2.0 | 2026-06-17 | **Mid-message deadline guard** — Added `innerLoopAborted` flag and pre-`appendToDoc()` deadline check inside Fathom messages loop; label application skipped on abort to preserve unprocessed messages for next cycle. **DriveFileFetcher** — Added `processDriveMatrixSync()` with `callWithRetry_()` exponential backoff, drive link discovery, and global clock guards. **Fathom email path** — Primary Gmail-based Fathom processing via `processFathomEmails()` with label-based dedup, plus secondary API poll fallback |
+| 1.3.0 | 2026-06-19 | **Split background triggers** — Replaced monolithic `runBackgroundSyncs` with `BackgroundSync.js`: four independent schedules (Fathom 15m, confirmations 1h, metrics 6h, drive daily 2 AM ET). Gmail confirmation dedup via `Processed-Confirmation` label. `installBackgroundTriggers()` one-shot setup. Weekly Slack digest via `WeeklyReporter.js` + `installWeeklyReportTrigger()` (Mon 11 AM ET). Deprecated `runBackgroundSyncs`. |
