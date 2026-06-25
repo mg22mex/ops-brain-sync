@@ -4,10 +4,14 @@
  * Each job stays under the 6-minute Apps Script limit. Run installBackgroundTriggers()
  * once after deploy to register schedules and remove the legacy combined trigger.
  *
+ * All background jobs now write individual dated Markdown files to per-source
+ * Drive folders instead of appending to a single master doc. Retention policies
+ * are enforced via cleanupOldFiles() at the end of each cycle.
+ *
  * Schedules (America/New_York where applicable):
- *   runFathomEmailSync        — every 15 minutes
- *   runConfirmationEmailSync  — every 1 hour
- *   runMetricsSync            — every 6 hours (Triple Whale + Sellerboard)
+ *   runFathomEmailSync        — every 15 minutes  → Fathom folder (permanent)
+ *   runConfirmationEmailSync  — every 1 hour      → Confirmations folder (3-day retention)
+ *   runMetricsSync            — every 6 hours     → Metrics folder (14-day retention)
  *   runDriveMatrixSyncJob     — daily at 2:00 AM
  */
 
@@ -16,7 +20,8 @@ var BACKGROUND_SYNC_HANDLERS_ = [
   'runFathomEmailSync',
   'runMetricsSync',
   'runDriveMatrixSyncJob',
-  'runConfirmationEmailSync'
+  'runConfirmationEmailSync',
+  'runSheetCompressionSync'
 ];
 
 var CONFIRMATION_EMAIL_LABEL_ = 'Processed-Confirmation';
@@ -56,8 +61,16 @@ function installBackgroundTriggers() {
     .inTimezone('America/New_York')
     .create();
 
+  ScriptApp.newTrigger('runSheetCompressionSync')
+    .timeBased()
+    .everyDays(1)
+    .atHour(3)
+    .inTimezone('America/New_York')
+    .create();
+
   console.log('[BackgroundSync] Installed triggers: Fathom email (15m), confirmations (1h), ' +
-    'metrics (6h), drive matrix (daily 2 AM ET). Legacy runBackgroundSyncs removed.');
+    'metrics (6h), drive matrix (daily 2 AM ET), sheet compression (daily 3 AM ET). ' +
+    'Legacy runBackgroundSyncs removed.');
 }
 
 /** @deprecated Use split triggers via installBackgroundTriggers(). */
@@ -66,7 +79,7 @@ function runBackgroundSyncs() {
     'Run installBackgroundTriggers() once to register split jobs.');
 }
 
-/** Fathom recap emails → target doc (Gmail primary path; no API poll). */
+/** Fathom recap emails → Fathom folder (Gmail primary path; no API poll). */
 function runFathomEmailSync() {
   console.log('[BackgroundSync] Fathom email sync starting');
   try {
@@ -76,16 +89,20 @@ function runFathomEmailSync() {
   }
 }
 
-/** Triple Whale + Sellerboard snapshots → target doc. */
+/** Triple Whale + Sellerboard snapshots → Metrics folder (14-day retention). */
 function runMetricsSync() {
   console.log('[BackgroundSync] Metrics sync starting');
-  var targetDocId = PropertiesService.getScriptProperties().getProperty('TARGET_DOC_ID')
-    || DEFAULT_TARGET_DOC_ID;
+  var metricsFolderId = PropertiesService.getScriptProperties().getProperty('METRICS_FOLDER_ID')
+    || DEFAULT_METRICS_FOLDER_ID;
+
+  var now = new Date();
+  var tz = 'America/New_York';
+  var dateStr = Utilities.formatDate(now, tz, 'yyyy-MM-dd');
 
   try {
     var twMarkdown = fetchTripleWhalePerformance();
     if (twMarkdown) {
-      appendToDoc(safeCheckAndRollover_(targetDocId), twMarkdown);
+      createNewDriveFile(metricsFolderId, dateStr + '_TripleWhale_Report.md', twMarkdown);
     }
   } catch (e) {
     console.error('[BackgroundSync] Triple Whale sync failed: %s', e.message);
@@ -94,11 +111,14 @@ function runMetricsSync() {
   try {
     var sbMarkdown = fetchSellerboardDaily();
     if (sbMarkdown) {
-      appendToDoc(safeCheckAndRollover_(targetDocId), sbMarkdown);
+      createNewDriveFile(metricsFolderId, dateStr + '_Sellerboard_Report.md', sbMarkdown);
     }
   } catch (e) {
     console.error('[BackgroundSync] Sellerboard sync failed: %s', e.message);
   }
+
+  // Enforce 14-day retention for metrics folder
+  cleanupOldFiles(metricsFolderId, 14);
 }
 
 /** Master matrix deep crawl → NotebookLM source folder (heavy; runs off-hours). */
@@ -119,7 +139,7 @@ function runDriveMatrixSyncJob() {
   }
 }
 
-/** Ops confirmation / order reference emails → target doc (label dedup). */
+/** Ops confirmation / order reference emails → Confirmations folder (3-day retention). */
 function runConfirmationEmailSync() {
   console.log('[BackgroundSync] Confirmation email sync starting');
   try {
@@ -130,12 +150,31 @@ function runConfirmationEmailSync() {
 }
 
 /**
+ * Compress configured heavy spreadsheets → compact .md snapshots
+ * to prevent "file too large" errors in NotebookLM.
+ * Configure via SHEET_COMPRESSION_TARGETS Script Property.
+ */
+function runSheetCompressionSync() {
+  console.log('[BackgroundSync] Sheet compression sync starting');
+  try {
+    processCompressionTargets();
+  } catch (e) {
+    console.error('[BackgroundSync] Sheet compression sync failed: %s', e.message);
+  }
+}
+
+/**
  * Gmail monitor for operational confirmations with Processed-Confirmation dedup.
+ * Writes each thread as an individual dated file to the Confirmations folder.
+ * Retention: 3 days (enforced at the end of each cycle).
  */
 function processConfirmationEmails_() {
   var lock = LockService.getScriptLock();
+  var lockHeld = false;
+
   try {
     lock.waitLock(30000);
+    lockHeld = true;
   } catch (e) {
     console.warn('[ConfirmationEmails] Lock busy — skipping cycle');
     return;
@@ -153,63 +192,123 @@ function processConfirmationEmails_() {
     var searchQuery = 'subject:(confirmation OR order OR reference OR "nrf" OR "color reference") ' +
       '-label:' + CONFIRMATION_EMAIL_LABEL_;
     var threads = GmailApp.search(searchQuery, 0, BATCH_SIZE);
-    var targetDocId = PropertiesService.getScriptProperties().getProperty('TARGET_DOC_ID')
-      || DEFAULT_TARGET_DOC_ID;
+    var confirmationsFolderId = PropertiesService.getScriptProperties().getProperty('CONFIRMATIONS_FOLDER_ID')
+      || DEFAULT_CONFIRMATIONS_FOLDER_ID;
+
+    var elapsedSearch = new Date().getTime() - startTime;
+    console.log('[ConfirmationEmails] GmailApp.search returned in %dms, found %d thread(s)',
+      elapsedSearch, threads.length);
+    if (elapsedSearch > TIME_LIMIT_MS) {
+      console.warn('[ConfirmationEmails] TIME LIMIT EXCEEDED after GmailApp.search (%dms)', elapsedSearch);
+      return;
+    }
 
     if (threads.length === 0) {
       console.log('[ConfirmationEmails] No unprocessed confirmation threads.');
       return;
     }
 
-    console.log('[ConfirmationEmails] Processing %d thread(s)', threads.length);
+    console.log('[ConfirmationEmails] Processing %d thread(s) (batch cap: %d)',
+      threads.length, BATCH_SIZE);
+
+    var processedCount = 0;
+    var now = new Date();
+    var tz = 'America/New_York';
+    var dateStr = Utilities.formatDate(now, tz, 'yyyy-MM-dd');
 
     for (var i = 0; i < threads.length; i++) {
-      if (new Date().getTime() - startTime > TIME_LIMIT_MS) {
-        console.log('[ConfirmationEmails] Time limit — stopping after %d thread(s)', i);
+      var elapsedTop = new Date().getTime() - startTime;
+      if (elapsedTop > TIME_LIMIT_MS) {
+        console.warn('[ConfirmationEmails] TIME LIMIT EXCEEDED at loop top (%dms / %dms cap) — ' +
+          'stopping after %d thread(s)',
+          elapsedTop, TIME_LIMIT_MS, i);
         break;
       }
 
       var thread = threads[i];
-      var messages = thread.getMessages();
-      var msg = messages[messages.length - 1];
-      var body = msg.getPlainBody();
-      if (!body) {
-        continue;
-      }
-
-      var payload = {
-        source: 'gmail_confirmation',
-        content: body,
-        metadata: { title: msg.getSubject() }
-      };
-      var markdown = formatAsMarkdown(payload);
-      var appended = false;
+      var written = false;
 
       try {
-        appendToDoc(safeCheckAndRollover_(targetDocId), markdown);
-        appended = true;
-      } catch (err) {
-        Utilities.sleep(3000);
-        try {
-          appendToDoc(safeCheckAndRollover_(targetDocId), markdown);
-          appended = true;
-        } catch (retryErr) {
-          console.error('[ConfirmationEmails] Append failed for "%s": %s',
-            msg.getSubject(), retryErr.message);
+        var messages = thread.getMessages();
+        var elapsedMsgs = new Date().getTime() - startTime;
+
+        if (elapsedMsgs > TIME_LIMIT_MS) {
+          console.warn('[ConfirmationEmails] TIME LIMIT EXCEEDED after getMessages() (%dms, thread %d/%d)',
+            elapsedMsgs, i + 1, threads.length);
+          break;
         }
+
+        var msg = messages[messages.length - 1];
+
+        // Atomic dedup: skip if this message ID is already in the registry
+        var msgId = msg.getId();
+        if (isMessageProcessed_(msgId)) {
+          console.log('[ConfirmationEmails] Skipping already-processed message %s: %s', msgId, msg.getSubject());
+          continue;
+        }
+
+        var body = msg.getPlainBody();
+        var elapsedBody = new Date().getTime() - startTime;
+        if (elapsedBody > TIME_LIMIT_MS) {
+          console.warn('[ConfirmationEmails] TIME LIMIT EXCEEDED after getPlainBody() (%dms, thread %d/%d)',
+            elapsedBody, i + 1, threads.length);
+          break;
+        }
+        if (!body) {
+          continue;
+        }
+
+        var payload = {
+          source: 'gmail_confirmation',
+          content: body,
+          metadata: { title: msg.getSubject() }
+        };
+        var markdown = formatAsMarkdown(payload);
+
+        // Build a unique filename from date + sanitized subject
+        var subject = msg.getSubject() || 'confirmation';
+        var safeSubject = subject.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 60);
+        var fileName = dateStr + '_Confirmation_' + safeSubject + '.md';
+
+        try {
+          createNewDriveFile(confirmationsFolderId, fileName, markdown);
+          markMessageProcessed_(msgId);
+          written = true;
+        } catch (writeErr) {
+          console.error('[ConfirmationEmails] Write failed for "%s": %s',
+            msg.getSubject(), writeErr.message);
+        }
+      } catch (msgErr) {
+        console.error('[ConfirmationEmails] Failed to process thread "%s": %s',
+          thread.getFirstMessageSubject(), msgErr.message);
       }
 
-      if (appended) {
+      if (written) {
         try {
           thread.addLabel(label);
+          processedCount++;
         } catch (labelErr) {
           console.warn('[ConfirmationEmails] Could not label thread: %s', labelErr.message);
         }
       }
     }
+
+    console.log('[ConfirmationEmails] Cycle complete. Processed %d thread(s) (batch cap: %d).',
+      processedCount, BATCH_SIZE);
+
+  } catch (err) {
+    console.error('[ConfirmationEmails] Processing error: %s', err.message);
   } finally {
-    lock.releaseLock();
+    if (lockHeld) {
+      lock.releaseLock();
+      console.log('[ConfirmationEmails] Lock released');
+    }
   }
+
+  // Enforce 3-day retention (runs outside the lock to avoid holding it during Drive calls)
+  var confirmationsFolderId = PropertiesService.getScriptProperties().getProperty('CONFIRMATIONS_FOLDER_ID')
+    || DEFAULT_CONFIRMATIONS_FOLDER_ID;
+  cleanupOldFiles(confirmationsFolderId, 3);
 }
 
 /**
@@ -228,3 +327,5 @@ function ensureGmailLabel_(name) {
     return null;
   }
 }
+
+function triggerPermissionCheck() { DriveApp.getRootFolder(); }

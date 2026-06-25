@@ -1,6 +1,6 @@
 # Architecture Document — ops-brain-sync
 
-> **Version:** 1.3.0  
+> **Version:** 1.5.0  
 > **Runtime:** Google Apps Script (V8 / ES5+)  
 > **Deployment Platform:** Clasp CLI → Google Workspace  
 > **Canonical Timezone:** America/New_York
@@ -114,10 +114,15 @@ BackgroundSync.js
   ├── TripleWhaleFetcher.js  (runMetricsSync)
   ├── SellerboardFetcher.js  (runMetricsSync)
   ├── DriveFileFetcher.js    (runDriveMatrixSyncJob)
+  ├── SpreadsheetCompressor.js (runSheetCompressionSync — daily 3 AM ET)
   └── processConfirmationEmails_() (runConfirmationEmailSync)
 
 WeeklyReporter.js
   └── postWeeklyReport (installWeeklyReportTrigger — Mon 11 AM ET)
+
+FileWriter.js
+  └── createNewDriveFile() / cleanupOldFiles() — all Drive file writes + retention
+  └── isMessageProcessed_() / markMessageProcessed_() — atomic Gmail dedup registry
 ```
 
 There are **no circular dependencies**. `runBackgroundSyncs()` is deprecated (no-op).
@@ -462,6 +467,84 @@ Exponential backoff is applied to all SpreadsheetApp, DocumentApp, and DriveApp
 calls to prevent transient "Service failed" errors from halting the deep crawl.
 ```
 
+### 4.9 FileWriter
+
+```
+createNewDriveFile(folderId: String, fileName: String, content: String) → String | null
+  - Validates: folderId, fileName, and content non-empty
+  - Sanitizes filename via sanitizeFileName()
+  - Removes existing files with the same name (trash before create)
+  - Creates file: folder.createFile(safeName, content, MimeType.PLAIN_TEXT)
+  - 3-attempt exponential backoff retry
+  - Returns new file ID on success, null on failure
+
+cleanupOldFiles(folderId: String, maxDays: Number, timeLimitMs?: Number) → void
+  - maxDays <= 0 → skip (permanent retention)
+  - Calculates cutoff: now - maxDays * 86400000 ms
+  - Iterates folder files; trashes those with getDateCreated() < cutoff
+  - 120s default time guard; logs count trashed
+
+sanitizeFileName(name: String) → String
+  - Replaces Drive-unsafe chars: <>:"/\|?* → _
+  - Collapses whitespace and repeated dots
+  - Truncates > 180 chars
+  - Ensures .md extension
+
+Message ID Registry (Script Properties — key: 'ProcessedMessageIDs'):
+  isMessageProcessed_(messageId: String) → Boolean
+    - Reads comma-separated list; returns true if messageId found
+  markMessageProcessed_(messageId: String) → void
+    - Appends messageId to FIFO list; cap at 500 entries
+    - Oldest entries truncated when over cap
+  resetMessageRegistry() → void
+    - Deletes the Script Property entirely
+```
+
+### 4.10 SpreadsheetCompressor
+
+```
+processCompressionTargets() → void
+  - Outer try/catch: catches fatal errors → notifyAdmin_()
+  - Master clock: TIME_LIMIT_MS = 300000 (5-minute guard)
+  - Step 1: get master spreadsheet ID via tryGetValidSpreadsheetId()
+  - Step 2: collectSpreadsheetIds_() — deduplicated list (master + linked sheets)
+  - Step 3: evaluateAndCompress_() per spreadsheet — size check + compression
+  - Step 4: collectDocUrls_() — scan columns D/E/F for Google Doc links
+  - Step 5: crawlAndConvertDocToMarkdown_() per doc URL
+
+collectSpreadsheetIds_(masterId, startTime, timeLimitMs) → String[]
+  - Opens master spreadsheet; scans all cell contents for /spreadsheets/d/{id}
+  - Dedup via object-map; includes masterId itself
+
+evaluateAndCompress_(sid: String, folderId: String) → 'compressed' | 'skipped' | 'failed'
+  - Input validation: SHEET_ID_REGEX_ = /^[a-zA-Z0-9-_]{20,}$/
+  - DriveApp.getFileById() → check size against MAX_SIZE_BYTES (10 MB)
+  - If under threshold → return 'skipped'
+  - If over → compress each sheet via compressSheetToMarkdown_()
+  - Save snapshot via saveCompressedSnapshot_()
+
+compressSheetToMarkdown_(sheet, opts) → String
+  - Per-row try/catch: corrupt rows are skipped, loop continues
+  - Skips empty rows; truncates cells at 200 chars
+  - Caps at 500 data rows; formats dates as YYYY-MM-DD
+  - Output: ### sheet name, metadata header, Markdown table
+
+crawlAndConvertDocToMarkdown_(url, docId, folderId) → void
+  - Input validation: DOC_ID_REGEX_ = /^[a-zA-Z0-9-_]{20,}$/
+  - DocumentApp.openById() → parse headings (H1→##, H2→###, H3→####)
+  - Extracts paragraphs and list items; skips tables/images/drawings
+  - Saves as {safeName}_compiled.md
+
+saveCompressedSnapshot_(folderId, fileName, content) → void
+  - 3-attempt retry: trash existing → create PLAIN_TEXT file
+  - 2s, 4s, 6s exponential backoff
+
+notifyAdmin_(subject: String, err: Error) → void
+  - Reads ADMIN_EMAIL Script Property; falls back to Session.getActiveUser().getEmail()
+  - Sends MailApp.sendEmail() with stack trace and timestamp
+  - Silently exits if no email available; self-wraps in try/catch
+```
+
 ---
 
 ## 5. State Management & Persistence
@@ -496,9 +579,16 @@ The pipeline uses three persistence mechanisms, each with distinct scope and lif
 | `FATHOM_API_KEY` | Secret | Manual setup | FathomFetcher |
 | `TRIPLE_WHALE_API_KEY` | Secret | Manual setup | TripleWhaleFetcher |
 | `SELLERBOARD_DAILY_LINK` | Secret | Manual setup | SellerboardFetcher |
-| `MASTER_SPREADSHEET_ID` | Config | Manual setup | (future) |
-| `NOTEBOOK_SOURCE_FOLDER_ID` | Config | Manual setup | (future) |
+| `MASTER_SPREADSHEET_ID` | Config | Manual setup | Code.js, SpreadsheetCompressor |
+| `NOTEBOOK_SOURCE_FOLDER_ID` | Config | Manual setup | BackgroundSync, SpreadsheetCompressor |
+| `ADMIN_EMAIL` | Config | Manual setup | SpreadsheetCompressor (notifyAdmin_) |
+| `FATHOM_FOLDER_ID` | Config | Manual setup (optional) | Code.js (doPost), FathomFetcher |
+| `METRICS_FOLDER_ID` | Config | Manual setup (optional) | BackgroundSync (runMetricsSync) |
+| `CONFIRMATIONS_FOLDER_ID` | Config | Manual setup (optional) | BackgroundSync (processConfirmationEmails_) |
 | `FATHOM_PROCESSED_IDS` | Runtime | FathomFetcher | FathomFetcher |
+| `ProcessedMessageIDs` | Runtime | FileWriter (markMessageProcessed_) | FileWriter (isMessageProcessed_) |
+| `LAST_PROCESSED_ROW` | Runtime | ClearSyncCache helper | — |
+| `SYNCED_ROWS_CACHE` | Runtime | ClearSyncCache helper | — |
 
 ### 5.3 LockService (Script Lock)
 
@@ -666,6 +756,7 @@ Verify via the **Triggers** page (clock icon):
 | `runConfirmationEmailSync` | Every hour |
 | `runMetricsSync` | Every 6 hours |
 | `runDriveMatrixSyncJob` | Daily ~2:00 AM ET |
+| `runSheetCompressionSync` | Daily ~3:00 AM ET |
 | `postWeeklyReport` | Monday 11:00 AM ET |
 
 Confirm **no** `runBackgroundSyncs` trigger remains. Check **Executions** for trigger-sourced runs with status **Completed**.
@@ -696,7 +787,9 @@ ops-brain-sync/
 │   ├── FathomFetcher.js     # Gmail Fathom recaps (Processed-Fathom label)
 │   ├── TripleWhaleFetcher.js# Triple Whale analytics polling
 │   ├── SellerboardFetcher.js# Sellerboard CSV fetch + parse
-│   └── DriveFileFetcher.js  # Master Matrix deep crawl + linked file extraction
+│   ├── DriveFileFetcher.js  # Master Matrix deep crawl + linked file extraction
+│   ├── FileWriter.js        # Per-source Drive file writer + retention lifecycle + Message ID Registry
+│   └── SpreadsheetCompressor.js # Heavy sheet → compact .md snapshots; Google Doc→Markdown conversion
 ```
 
 ### 10.2 Push/Pull Workflow
@@ -736,3 +829,5 @@ Local edits → clasp push → Apps Script (remote) → clasp deploy → Web App
 | 1.1.0 | 2026-06-17 | **Global master clock refactor** — Replaced per-module local timers (5 min each) with single `SCRIPT_START_TIME` + `GLOBAL_MAX_EXECUTION_MS = 240000` at `runBackgroundSyncs()` entry; inter-fetcher deadline barriers between each module; all loop guards reference global clock via `break`-based early exits |
 | 1.2.0 | 2026-06-17 | **Mid-message deadline guard** — Added `innerLoopAborted` flag and pre-`appendToDoc()` deadline check inside Fathom messages loop; label application skipped on abort to preserve unprocessed messages for next cycle. **DriveFileFetcher** — Added `processDriveMatrixSync()` with `callWithRetry_()` exponential backoff, drive link discovery, and global clock guards. **Fathom email path** — Primary Gmail-based Fathom processing via `processFathomEmails()` with label-based dedup, plus secondary API poll fallback |
 | 1.3.0 | 2026-06-19 | **Split background triggers** — Replaced monolithic `runBackgroundSyncs` with `BackgroundSync.js`: four independent schedules (Fathom 15m, confirmations 1h, metrics 6h, drive daily 2 AM ET). Gmail confirmation dedup via `Processed-Confirmation` label. `installBackgroundTriggers()` one-shot setup. Weekly Slack digest via `WeeklyReporter.js` + `installWeeklyReportTrigger()` (Mon 11 AM ET). Deprecated `runBackgroundSyncs`. |
+| 1.4.0 | 2026-06-24 | **NotionSyncEngine** — Schema-driven spreadsheet-to-Notion sync with entity lookup fallback (block children for multi-source DBs), domain-based multi-select tagging via `extractResourceDomain_()`. **Smart Chip URL extraction** — `getRichTextValue().getLinkUrl()` replaces `.getValue()` for Resource/Link columns, enabling URL extraction from Google Sheets Smart Chips. **Case-insensitive upsert dedup** — `fetchMatrixPageLookup_()` caches existing pages; `upsertMatrixRow_()` PATCHes on title match to prevent row duplication. **SpreadsheetCompressor** — Dynamic size-based sheet→.md compression at 10 MB threshold. **DocAppender rolling log** — 850 KB size-triggered rollover with dated journal naming. **Folder ID unification** — All pipelines route to unified NotebookLM source folder. |
+| 1.5.0 | 2026-06-24 | **Notion purge** — Removed NotionSyncEngine.js and all Notion references across the codebase. **FileWriter** — Modular per-source Drive file writer with retention lifecycle (`cleanupOldFiles`) and Message ID Registry for atomic Gmail dedup. **SpreadsheetCompressor safeguards** — Per-row error boundaries in `compressSheetToMarkdown_()`, 5-minute execution timeout guard, strict ID format regex validation (`SHEET_ID_REGEX_`, `DOC_ID_REGEX_`), admin email alerts via `notifyAdmin_()`. **Architecture** — 100% Google-native stack (no external API bridges). |

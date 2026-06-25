@@ -2,31 +2,35 @@
  * FathomFetcher — Gmail-based Fathom notification processing + API polling fallback
  * ==================================================================================
  * Primary path: searches Gmail for Fathom "Recap for" notification emails, processes
- * them in batches with label-based dedup, and appends formatted content to the
- * target document. Falls back to direct API polling for comprehensive coverage.
+ * them in batches with label-based dedup, and writes individual dated Markdown files
+ * to the Fathom folder. Falls back to direct API polling for comprehensive coverage.
+ *
+ * Retention: Permanent (no cleanup cycle needed for Fathom logs).
  */
 
 /**
  * Process Fathom notification emails via Gmail with label-based dedup.
  * Searches for unprocessed Fathom recap emails, extracts content,
- * appends to the target doc, then marks with 'Processed-Fathom' label.
+ * writes individual files to the Fathom folder, then marks with
+ * 'Processed-Fathom' label.
  */
 function processFathomEmails() {
   var lock = LockService.getScriptLock();
+  var lockHeld = false;
+
   try {
     lock.waitLock(30000);
+    lockHeld = true;
   } catch (e) {
     console.warn('[FathomFetcher] Lock busy — skipping email processing cycle');
     return;
   }
 
   try {
-    // Track execution time for early-exit guard (5-minute ceiling)
     var startTime = new Date().getTime();
     var TIME_LIMIT_MS = 300000;
     var BATCH_SIZE = 5;
 
-    // Ensure the tracking label exists (idempotent — create only if missing)
     var label;
     try {
       label = GmailApp.getUserLabelByName('Processed-Fathom');
@@ -38,9 +42,14 @@ function processFathomEmails() {
       return;
     }
 
-    // Search for unprocessed Fathom recap threads, capped at batch size
     var query = 'from:fathom (subject:"Recap for" OR subject:"Recap of your meeting") -label:Processed-Fathom';
     var threads = GmailApp.search(query, 0, BATCH_SIZE);
+    var elapsedMs = new Date().getTime() - startTime;
+    console.log('[FathomFetcher] GmailApp.search returned in %dms, found %d thread(s)', elapsedMs, threads.length);
+    if (elapsedMs > TIME_LIMIT_MS) {
+      console.warn('[FathomFetcher] TIME LIMIT EXCEEDED after GmailApp.search (%dms)', elapsedMs);
+      return;
+    }
 
     if (threads.length === 0) {
       console.log('[FathomFetcher] No unprocessed Fathom recap emails found.');
@@ -49,78 +58,113 @@ function processFathomEmails() {
 
     console.log('[FathomFetcher] Found %d unprocessed Fathom thread(s)', threads.length);
 
-    var targetDocId = PropertiesService.getScriptProperties().getProperty('TARGET_DOC_ID');
-    if (!targetDocId) {
-      console.error('[FathomFetcher] TARGET_DOC_ID not set — cannot append');
-      return;
-    }
+    var fathomFolderId = PropertiesService.getScriptProperties().getProperty('FATHOM_FOLDER_ID')
+      || DEFAULT_FATHOM_FOLDER_ID;
 
     var processedCount = 0;
+    var threadsChecked = 0;
+    var now = new Date();
+    var tz = 'America/New_York';
+    var dateStr = Utilities.formatDate(now, tz, 'yyyy-MM-dd');
 
     for (var t = 0; t < threads.length; t++) {
-      // Time-remaining guard: exit before 6-minute hard limit to save cleanly
-      if (new Date().getTime() - startTime > TIME_LIMIT_MS) {
-        console.log('[FathomFetcher] Time limit reached (%dms) — exiting early after %d thread(s) processed.',
-          TIME_LIMIT_MS, processedCount);
+      var elapsedOuter = new Date().getTime() - startTime;
+      if (elapsedOuter > TIME_LIMIT_MS) {
+        console.warn('[FathomFetcher] TIME LIMIT EXCEEDED at loop top (%dms / %dms cap) — ' +
+          'exiting after %d processed, thread %d/%d',
+          elapsedOuter, TIME_LIMIT_MS, processedCount, t + 1, threads.length);
         break;
       }
 
       var thread = threads[t];
       var messages = thread.getMessages();
+      var elapsedGs = new Date().getTime() - startTime;
+      if (elapsedGs > TIME_LIMIT_MS) {
+        console.warn('[FathomFetcher] TIME LIMIT EXCEEDED after getMessages() (%dms, thread %d/%d)',
+          elapsedGs, t + 1, threads.length);
+        break;
+      }
 
       for (var m = 0; m < messages.length; m++) {
-        var msg = messages[m];
-
-        // Confirm the message is actually from Fathom
-        if (msg.getFrom().indexOf('fathom.video') === -1 &&
-            msg.getFrom().indexOf('fathom') === -1) {
-          continue;
+        if (new Date().getTime() - startTime > TIME_LIMIT_MS) {
+          console.log('[FathomFetcher] Time limit reached during message processing — exiting');
+          break;
         }
-
-        var bodyContent = msg.getPlainBody();
-        if (!bodyContent || bodyContent.length === 0) continue;
-
-        // Truncate oversized transcripts to stay within document bloat guard
-        if (bodyContent.length > 15000) {
-          bodyContent = bodyContent.substring(0, 15000) +
-            '\n\n...[Transcript truncated for size safety]...';
-        }
-
-        var payload = {
-          source: 'fathom',
-          content: bodyContent,
-          metadata: { title: msg.getSubject() }
-        };
-        var markdown = formatAsMarkdown(payload);
 
         try {
-          var docId = safeCheckAndRollover_(targetDocId);
-          appendToDoc(docId, markdown);
+          var msg = messages[m];
+
+          if (msg.getFrom().indexOf('fathom.video') === -1 &&
+              msg.getFrom().indexOf('fathom') === -1) {
+            continue;
+          }
+
+          // Atomic dedup: skip if this message ID is already in the registry
+          var msgId = msg.getId();
+          if (isMessageProcessed_(msgId)) {
+            console.log('[FathomFetcher] Skipping already-processed message %s: %s', msgId, msg.getSubject());
+            continue;
+          }
+
+          var bodyContent = msg.getPlainBody();
+          var elapsedBody = new Date().getTime() - startTime;
+          if (elapsedBody > TIME_LIMIT_MS) {
+            console.warn('[FathomFetcher] TIME LIMIT EXCEEDED after getPlainBody() (%dms, thread %d/%d)',
+              elapsedBody, t + 1, threads.length);
+            break;
+          }
+          if (!bodyContent || bodyContent.length === 0) continue;
+
+          if (bodyContent.length > 15000) {
+            bodyContent = bodyContent.substring(0, 15000) +
+              '\n\n...[Transcript truncated for size safety]...';
+          }
+
+          var payload = {
+            source: 'fathom',
+            content: bodyContent,
+            metadata: { title: msg.getSubject() }
+          };
+          var markdown = formatAsMarkdown(payload);
+
+          var subject = msg.getSubject() || 'Fathom_Meeting';
+          var safeSubject = subject.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 60);
+          var fileName = dateStr + '_Fathom_' + safeSubject + '.md';
+          createNewDriveFile(fathomFolderId, fileName, markdown);
+          markMessageProcessed_(msgId);
+
           processedCount++;
-          console.log('[FathomFetcher] Processed message: %s', msg.getSubject());
-        } catch (appendErr) {
-          console.error('[FathomFetcher] Failed to append message "%s": %s',
-            msg.getSubject(), appendErr.message);
-          // Skip this message but continue with others
+          console.log('[FathomFetcher] Processed message: %s → %s', msg.getSubject(), fileName);
+        } catch (msgErr) {
+          console.error('[FathomFetcher] Failed to process message: %s', msgErr.message);
           continue;
         }
       }
 
-      // Apply the Processed-Fathom label to the entire thread
+      if (new Date().getTime() - startTime > TIME_LIMIT_MS) {
+        console.log('[FathomFetcher] Time limit reached — skipping label for remaining threads');
+        break;
+      }
+
       try {
         thread.addLabel(label);
       } catch (labelErr) {
         console.warn('[FathomFetcher] Could not apply label to thread: %s', labelErr.message);
       }
+
+      threadsChecked++;
     }
 
-    console.log('[FathomFetcher] Cycle complete. Processed %d message(s) across %d thread(s).',
-      processedCount, t);
+    console.log('[FathomFetcher] Cycle complete. Processed %d message(s) across %d thread(s) (batch cap: %d).',
+      processedCount, threadsChecked, BATCH_SIZE);
 
   } catch (err) {
     console.error('[FathomFetcher] Email processing error: %s', err.message);
   } finally {
-    lock.releaseLock();
+    if (lockHeld) {
+      lock.releaseLock();
+      console.log('[FathomFetcher] Lock released');
+    }
   }
 }
 
@@ -139,7 +183,6 @@ function fetchRecentMeetings() {
     return null;
   }
 
-  // 48-hour lookback window
   var lookbackDate = new Date();
   lookbackDate.setDate(lookbackDate.getDate() - 2);
   var afterTimestamp = lookbackDate.toISOString();

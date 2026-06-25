@@ -24,10 +24,12 @@ Building a serverless Google Apps Script Web App that acts as a central data sta
 | `MarkdownFormatter.js` | Payload → Markdown |
 | `DocAppender.js` | Append to Google Doc with retry backoff |
 | `RolloverManager.js` | Word-count guard + monthly doc rollover |
-| `FathomFetcher.js` | Fathom recap Gmail → doc (`Processed-Fathom` label) |
+| `FileWriter.js` | Per-folder Drive file writer + retention lifecycle + Message ID Registry for atomic Gmail dedup |
+| `FathomFetcher.js` | Fathom recap Gmail → doc (`Processed-Fathom` label) with Message ID Registry dedup |
 | `TripleWhaleFetcher.js` | Triple Whale metrics → doc |
 | `SellerboardFetcher.js` | Sellerboard CSV → doc |
 | `DriveFileFetcher.js` | Master matrix deep crawl → NotebookLM folder |
+| `SpreadsheetCompressor.js` | Heavy sheet → compact .md snapshots for NotebookLM; also converts Google Doc links to Markdown |
 | `WeeklyReporter.js` | Monday Slack digest + `installWeeklyReportTrigger()` |
 
 ## Background Jobs (split triggers)
@@ -40,6 +42,7 @@ Run **`installBackgroundTriggers()`** once from `BackgroundSync.gs` after each d
 | `runConfirmationEmailSync` | Every 1 hour | Ops confirmation emails → doc (`Processed-Confirmation` label) |
 | `runMetricsSync` | Every 6 hours | Triple Whale + Sellerboard → doc |
 | `runDriveMatrixSyncJob` | Daily 2:00 AM ET | `processDriveMatrixSync()` — heavy crawl |
+| `runSheetCompressionSync` | Daily 3:00 AM ET | `processCompressionTargets()` — size-based sheet compression + doc Markdown |
 
 `runBackgroundSyncs()` is **deprecated** (no-op + log warning). Delete any leftover trigger manually if needed.
 
@@ -73,3 +76,7 @@ Run **`installWeeklyReportTrigger()`** once from `WeeklyReporter.gs` → Monday 
 | `SLACK_WEBHOOK_URL` | Weekly digest Slack webhook |
 | `OPS_CALENDAR_ID` | Calendar for weekly meeting list |
 | `OPS_REPORT_TZ` | Report timezone (defaults to `America/New_York`) |
+| `ADMIN_EMAIL` | Notification email for fatal error alerts (SpreadsheetCompressor safeguards) |
+| `FATHOM_FOLDER_ID` | Drive folder for Fathom meeting recaps |
+| `METRICS_FOLDER_ID` | Drive folder for metrics snapshots |
+| `CONFIRMATIONS_FOLDER_ID` | Drive folder for order confirmation emails |

@@ -3,12 +3,19 @@
  *
  * Entry points: doGet / doPost (webhooks). Background jobs live in BackgroundSync.js
  * (run installBackgroundTriggers once after deploy).
+ *
+ * All pipeline data now routes to individual Drive files in per-source folders.
+ * See FileWriter.js for the write + retention lifecycle layer.
  */
 
 // 1. Raw configuration fallbacks
 var DEFAULT_MASTER_SPREADSHEET_ID = '1d6ljzCm_JW6KT6yR0-GMii6cwZqcGG0UwZKZT9UNWCY';
-var DEFAULT_TARGET_DOC_ID = '10miHbalFoWzkwmGV9oHVU-CDWl8dXLZz4o2tby6lzcM';
-var DEFAULT_NOTEBOOK_SOURCE_FOLDER_ID = '1xyKFtE1a5kCAHve8bASGOcchAthPNLrB';
+var DEFAULT_NOTEBOOK_SOURCE_FOLDER_ID = '1PBUHSJvqg3yNHH1gaJn0nhYcG0SLvoBE';
+
+// Folder targets for the file-per-record architecture (set Script Properties to override)
+var DEFAULT_FATHOM_FOLDER_ID = '1PBUHSJvqg3yNHH1gaJn0nhYcG0SLvoBE';
+var DEFAULT_METRICS_FOLDER_ID = '1PBUHSJvqg3yNHH1gaJn0nhYcG0SLvoBE';
+var DEFAULT_CONFIRMATIONS_FOLDER_ID = '1PBUHSJvqg3yNHH1gaJn0nhYcG0SLvoBE';
 
 // 2. Self-healing sanitization
 function sanitizeSpreadsheetId(id) {
@@ -64,7 +71,7 @@ function doGet(e) {
  */
 function cleanSlackUserMentions(text) {
   if (!text) return text;
-  
+
   var slackUserMap = {
     'U066ARLFH4K':  'Sunny (Sajjad)',
     'U4Y0JPMD4':    'Rick Reichmuth',
@@ -78,12 +85,12 @@ function cleanSlackUserMentions(text) {
   };
 
   var cleanedText = text;
-  
+
   Object.keys(slackUserMap).forEach(function(userId) {
     var regex = new RegExp('<@' + userId + '(?:\\|[^>]*)?>', 'g');
     cleanedText = cleanedText.replace(regex, slackUserMap[userId]);
   });
-  
+
   return cleanedText;
 }
 
@@ -91,54 +98,58 @@ function doPost(e) {
   try {
     var data = JSON.parse(e.postData.contents);
     if (data.type === 'url_verification') return ContentService.createTextOutput(data.challenge);
-    
+
     var parsed = parsePayload(data);
-    
+
     if (parsed.source === 'slack' && parsed.content) {
       parsed.content = cleanSlackUserMentions(parsed.content);
     }
-    
+
     var markdown = formatAsMarkdown(parsed);
-    var targetDocId = PropertiesService.getScriptProperties().getProperty('TARGET_DOC_ID') || DEFAULT_TARGET_DOC_ID;
     var notebookFolderId = PropertiesService.getScriptProperties().getProperty('NOTEBOOK_SOURCE_FOLDER_ID') || DEFAULT_NOTEBOOK_SOURCE_FOLDER_ID;
-    
-    var activeDocId = safeCheckAndRollover_(targetDocId);
-    
-    if (parsed.source === 'slack') {
-      appendSlackToDailyFile(notebookFolderId, markdown);
-    } else {
-      appendToDoc(activeDocId, markdown);
+
+    // Route webhook data to the appropriate folder
+    var folderId = notebookFolderId;
+    if (parsed.source === 'fathom') {
+      folderId = PropertiesService.getScriptProperties().getProperty('FATHOM_FOLDER_ID') || DEFAULT_FATHOM_FOLDER_ID;
     }
+
+    var now = new Date();
+    var tz = 'America/New_York';
+    var dateStr = Utilities.formatDate(now, tz, 'yyyy-MM-dd');
+    var safeSource = (parsed.source || 'webhook').replace(/[^a-zA-Z0-9]/g, '_');
+    var fileName = dateStr + '_' + safeSource + '_Webhook.md';
+
+    createNewDriveFile(folderId, fileName, markdown);
+
     return jsonResponse(200, { status: 'ok' });
   } catch (err) {
     return jsonResponse(500, { error: err.message });
   }
 }
 
-/**
- * Robust Self-Healing Rollover Safety Engine
- */
-function safeCheckAndRollover_(currentDocId) {
-  try {
-    return checkAndRolloverIfNeeded_(currentDocId);
-  } catch (err) {
-    console.warn('[Rollover Safety] Document is inaccessible or corrupt. Forcing emergency rollover execution...');
-    try {
-      var currentDoc = DocumentApp.openById(currentDocId);
-      var name = currentDoc.getName() + ' - Archive Fallback ' + new Date().toLocaleDateString();
-      var newDoc = DocumentApp.create(name);
-      var newId = newDoc.getId();
-      
-      PropertiesService.getScriptProperties().setProperty('TARGET_DOC_ID', newId);
-      console.log('[Rollover Safety] Emergency recovery successful. New Target Active Document ID: ' + newId);
-      return newId;
-    } catch (emergencyErr) {
-      console.error('[Rollover Safety] Total lock environment reached. Falling back to base configurations: ' + emergencyErr.message);
-      return currentDocId;
-    }
-  }
-}
-
 function jsonResponse(httpCode, body) {
   return ContentService.createTextOutput(JSON.stringify(body)).setMimeType(ContentService.MimeType.JSON);
 }
+
+function clearSyncCache() {
+  var properties = PropertiesService.getScriptProperties();
+  properties.deleteProperty('LAST_PROCESSED_ROW');
+  properties.deleteProperty('SYNCED_ROWS_CACHE');
+  console.log("Sync history successfully reset. Ready for a clean run!");
+}
+
+function breakTheLock() {
+  var lock = LockService.getScriptLock();
+  lock.releaseLock();
+  console.log("Success: The zombie script lock has been cleared!");
+}
+
+function forceReleaseLock() {
+  var lock = LockService.getScriptLock();
+  lock.releaseLock();
+  console.log('[LockManager] Lock forcefully released successfully.');
+}
+
+function triggerPermissionCheck() { DriveApp.getRootFolder(); }
+

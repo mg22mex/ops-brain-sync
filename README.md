@@ -6,7 +6,7 @@
 
 ## Executive Overview
 
-ops-brain-sync is a serverless Google Apps Script data integration engine that operates as both a real-time webhook receiver and a scheduled polling orchestration layer. It ingests operational intelligence from four primary data planes — team communications (Slack), meeting intelligence (Fathom), e-commerce analytics (Triple Whale), and financial performance (Sellerboard) — and pipes clean, structured Markdown into a centralized Google Doc repository for downstream AI-augmented retrieval in NotebookLM.
+ops-brain-sync is a serverless Google Apps Script data integration engine that operates as both a real-time webhook receiver and a scheduled polling orchestration layer. It ingests operational intelligence from four primary data planes — team communications (Slack), meeting intelligence (Fathom), e-commerce analytics (Triple Whale), and financial performance (Sellerboard) — and pipes clean, structured Markdown into per-source Drive folders for downstream AI-augmented retrieval in NotebookLM.
 
 ### Core Objectives
 
@@ -108,6 +108,8 @@ flowchart LR
 | **Triple Whale Fetcher** | `TripleWhaleFetcher.js` | Poller | POST to Triple Whale summary endpoint; render metrics as Markdown |
 | **Sellerboard Fetcher** | `SellerboardFetcher.js` | Poller | Fetch CSV from pre-signed URL; extract latest row as key/value table |
 | **Drive File Fetcher** | `DriveFileFetcher.js` | Crawler | Deep-crawl master spreadsheet; save Markdown snapshots to NotebookLM folder |
+| **File Writer** | `FileWriter.js` | Writer | Per-source Drive file writer with retention lifecycle; Message ID Registry for atomic Gmail dedup |
+| **Sheet Compressor** | `SpreadsheetCompressor.js` | Compressor | Size-based sheet→.md compression at 10 MB threshold; Google Doc→Markdown conversion |
 | **Weekly Reporter** | `WeeklyReporter.js` | Reporter | Monday Slack digest from Calendar + Gmail/doc recaps; `installWeeklyReportTrigger()` |
 
 ---
@@ -130,6 +132,10 @@ Set these in the Apps Script editor under **Project Settings > Script Properties
 | `OPS_CALENDAR_ID` | Google Calendar ID for weekly meeting list | Yes (for weekly report) |
 | `OPS_CALENDAR_DEDICATED` | Set to `true` if calendar is ops-only (no title filter) | No |
 | `OPS_REPORT_TZ` | Timezone for report week boundaries (default `America/New_York`) | No |
+| `ADMIN_EMAIL` | Admin notification email for fatal error alerts | No |
+| `FATHOM_FOLDER_ID` | Drive folder for Fathom recap Markdown files | No (uses NOTEBOOK_SOURCE_FOLDER_ID) |
+| `METRICS_FOLDER_ID` | Drive folder for Triple Whale + Sellerboard reports | No (uses NOTEBOOK_SOURCE_FOLDER_ID) |
+| `CONFIRMATIONS_FOLDER_ID` | Drive folder for confirmation email snapshots | No (uses NOTEBOOK_SOURCE_FOLDER_ID) |
 
 ### Timezone
 
@@ -323,7 +329,7 @@ Run these **once** (function dropdown → Run → authorize if prompted):
 
 | Function | File | Creates |
 |----------|------|---------|
-| `installBackgroundTriggers()` | `BackgroundSync.gs` | Four split background triggers (removes legacy `runBackgroundSyncs`) |
+| `installBackgroundTriggers()` | `BackgroundSync.gs` | Five split background triggers + sheet compression (removes legacy `runBackgroundSyncs`) |
 | `installWeeklyReportTrigger()` | `WeeklyReporter.gs` | Monday 11:00 AM ET → `postWeeklyReport` |
 
 Verify on the **Triggers** page (clock icon):
@@ -334,7 +340,10 @@ Verify on the **Triggers** page (clock icon):
 | `runConfirmationEmailSync` | Every hour |
 | `runMetricsSync` | Every 6 hours |
 | `runDriveMatrixSyncJob` | Daily ~2:00 AM ET |
+| `runSheetCompressionSync` | Daily ~3:00 AM ET |
 | `postWeeklyReport` | Monday 11:00 AM ET |
+
+**Manual execution** — Individual handlers can be run from the editor dropdown for smoke testing.
 
 Delete any leftover `runBackgroundSyncs` trigger if it still appears.
 

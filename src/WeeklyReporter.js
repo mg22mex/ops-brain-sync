@@ -26,8 +26,7 @@
  *   OPS_CALENDAR_DEDICATED — 'true' if OPS_CALENDAR_ID is a team-only calendar
  *   OPS_REPORT_TZ          — Display timezone (default: calendar TZ, e.g. America/Mexico_City)
  *
- * Falls back to DEFAULT_TARGET_DOC_ID from Code.js if no
- * TARGET_DOC_ID is set in Script Properties.
+ * TARGET_DOC_ID in Script Properties (set separately from pipeline config).
  */
 
 // ---------------------------------------------------------------------------
@@ -157,8 +156,7 @@ function postWeeklyReport() {
  * @param {number} runStart — Date.now() at entry
  */
 function postWeeklyReport_(webhookUrl, runStart) {
-  var docId = PropertiesService.getScriptProperties().getProperty('TARGET_DOC_ID')
-    || (typeof DEFAULT_TARGET_DOC_ID !== 'undefined' ? DEFAULT_TARGET_DOC_ID : null);
+  var docId = PropertiesService.getScriptProperties().getProperty('TARGET_DOC_ID');
 
   if (!docId) {
     console.error('[WeeklyReporter] No TARGET_DOC_ID found — aborting.');
@@ -1847,42 +1845,5 @@ function debugWeeklyGmailRecaps() {
     console.log('[debug] Calendar: "%s" (%s) → gmail %s',
       ev.title, ev.date,
       hit ? ('"' + hit.rawTitle + '" ' + hit.takeaways.length + ' bullets') : 'MISS');
-  }
-}
-
-/**
- * Diagnostic — run from Apps Script editor to inspect Gmail recap parsing.
- * Logs every Fathom email found for the current reporting week.
- */
-function debugWeeklyGmailRecaps() {
-  var weekRange = getWeekRange_();
-  var bounds = gmailWeekQueryBounds_(weekRange);
-  console.log('[debug] Week %s – %s | query after:%s before:%s',
-    Utilities.formatDate(weekRange.start, getReportTz_(), 'yyyy-MM-dd'),
-    Utilities.formatDate(weekRange.end, getReportTz_(), 'yyyy-MM-dd'),
-    bounds.after, bounds.before);
-
-  var recaps = fetchGmailRecaps_(weekRange);
-  for (var i = 0; i < recaps.length; i++) {
-    var r = recaps[i];
-    console.log('[debug] %d. "%s" date=%s takeaways=%d subject-match ok',
-      i + 1, r.rawTitle, r.date, r.takeaways.length);
-    for (var t = 0; t < Math.min(r.takeaways.length, 3); t++) {
-      console.log('       • %s', r.takeaways[t].substring(0, 120));
-    }
-  }
-
-  var calendarEvents = fetchCalendarMeetings_(weekRange);
-  for (var c = 0; c < calendarEvents.length; c++) {
-    var ev = calendarEvents[c];
-    var hit = null;
-    for (var g = 0; g < recaps.length; g++) {
-      if (titlesMatch_(ev.title, recaps[g].rawTitle)) {
-        hit = recaps[g];
-        break;
-      }
-    }
-    console.log('[debug] Calendar: "%s" (%s) → gmail %s',
-      ev.title, ev.date, hit ? ('"' + hit.rawTitle + '" ' + hit.takeaways.length + ' bullets') : 'MISS');
   }
 }

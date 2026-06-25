@@ -33,16 +33,22 @@ function fetchTripleWhalePerformance() {
     }
   };
 
-  var response = UrlFetchApp.fetch(url, {
-    method: 'post',
-    contentType: 'application/json',
-    headers: {
-      'x-api-key': apiKey,
-      'Accept': 'application/json'
-    },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  });
+  var response;
+  try {
+    response = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      headers: {
+        'x-api-key': apiKey,
+        'Accept': 'application/json'
+      },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+  } catch (netErr) {
+    console.error('[TripleWhaleFetcher] Network error fetching API: %s', netErr.message);
+    return null;
+  }
 
   var httpCode = response.getResponseCode();
   if (httpCode !== 200) {

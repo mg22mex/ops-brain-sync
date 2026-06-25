@@ -22,9 +22,15 @@ function fetchSellerboardDaily() {
     return null;
   }
 
-  var response = UrlFetchApp.fetch(csvUrl, {
-    muteHttpExceptions: true
-  });
+  var response;
+  try {
+    response = UrlFetchApp.fetch(csvUrl, {
+      muteHttpExceptions: true
+    });
+  } catch (netErr) {
+    console.error('[SellerboardFetcher] Network error fetching CSV: %s', netErr.message);
+    return null;
+  }
 
   var httpCode = response.getResponseCode();
   if (httpCode < 200 || httpCode >= 300) {
